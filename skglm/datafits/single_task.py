@@ -1,7 +1,7 @@
 import numpy as np
 from numpy.linalg import norm
 from numba import njit
-from numba import float64, int64, bool_
+from numba import float64, int64, bool_, uint8
 
 from skglm.datafits.base import BaseDatafit
 from skglm.utils.sparse_ops import spectral_norm, _sparse_xj_dot
@@ -974,6 +974,8 @@ class ClippedQuadratic(BaseDatafit):
         return (
             ('a', float64),
             ('b', float64),
+            ('Xty_prime', float64[:]),
+            ('saturation_mask', uint8[:]),
         )
 
     def params_to_dict(self):
@@ -1000,7 +1002,42 @@ class ClippedQuadratic(BaseDatafit):
         return lipschitz
 
     def initialize(self, X, y):
-        pass
+        n_samples, n_features = X.shape
+        self.Xty_prime = np.zeros(n_features, dtype=X.dtype)
+        self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
+        # For ClippedQuadratic, mask identifies samples outside [a, b]
+        for i in range(n_samples):
+            if y[i] >= self.b:
+                self.saturation_mask[i] = 1 # Upper
+            elif y[i] <= self.a:
+                self.saturation_mask[i] = 2 # Lower
+            else:
+                self.saturation_mask[i] = 0 # Linear
+                
+        for j in range(n_features):
+            res = 0.
+            for i in range(n_samples):
+                res += X[i, j] * y[i]
+            self.Xty_prime[j] = res
+
+    def initialize_sparse(self, X_data, X_indptr, X_indices, y):
+        n_samples = len(y)
+        n_features = len(X_indptr) - 1
+        self.Xty_prime = np.zeros(n_features, dtype=X_data.dtype)
+        self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
+        for i in range(n_samples):
+            if y[i] >= self.b:
+                self.saturation_mask[i] = 1
+            elif y[i] <= self.a:
+                self.saturation_mask[i] = 2
+            else:
+                self.saturation_mask[i] = 0
+                
+        for j in range(n_features):
+            res = 0.
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                res += X_data[i] * y[X_indices[i]]
+            self.Xty_prime[j] = res
 
     def value(self, y, w, Xw):
         clipped = np.clip(Xw, self.a, self.b)
@@ -1036,39 +1073,29 @@ class ClippedQuadratic(BaseDatafit):
 
     def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
         n = len(Xw)
-        val = 0.
-        if self.a <= -1e10:
-            for i in range(X_indptr[j], X_indptr[j+1]):
-                idx_i = X_indices[i]
-                zi = Xw[idx_i]
-                if zi <= self.b:
-                    val += X_data[i] * (zi - y[idx_i])
-        else:
-            for i in range(X_indptr[j], X_indptr[j+1]):
-                idx_i = X_indices[i]
-                zi = Xw[idx_i]
-                if self.a <= zi <= self.b:
-                    val += X_data[i] * (zi - y[idx_i])
-        return val / n
+        # Grad = 1/n * sum_{zi in [a, b]} Xij * (zi - yi)
+        # = 1/n * (Xj.T @ (Xw - y) - Correction)
+        res = -self.Xty_prime[j]
+        for i in range(X_indptr[j], X_indptr[j+1]):
+            idx_i = X_indices[i]
+            zi = Xw[idx_i]
+            res += X_data[i] * zi
+            if zi < self.a or zi > self.b:
+                res -= X_data[i] * (zi - y[idx_i])
+        return res / n
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
         n_features = len(X_indptr) - 1
         n = len(y)
         grad = np.zeros(n_features, dtype=Xw.dtype)
         for j in range(n_features):
-            res = 0.
-            if self.a <= -1e10:
-                for i in range(X_indptr[j], X_indptr[j+1]):
-                    idx_i = X_indices[i]
-                    zi = Xw[idx_i]
-                    if zi <= self.b:
-                        res += X_data[i] * (zi - y[idx_i])
-            else:
-                for i in range(X_indptr[j], X_indptr[j+1]):
-                    idx_i = X_indices[i]
-                    zi = Xw[idx_i]
-                    if self.a <= zi <= self.b:
-                        res += X_data[i] * (zi - y[idx_i])
+            res = -self.Xty_prime[j]
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                idx_i = X_indices[i]
+                zi = Xw[idx_i]
+                res += X_data[i] * zi
+                if zi < self.a or zi > self.b:
+                    res -= X_data[i] * (zi - y[idx_i])
             grad[j] = res / n
         return grad
 
@@ -1134,6 +1161,7 @@ class LeakyClippedQuadratic(BaseDatafit):
             ('b', float64),
             ('alpha', float64),
             ('Xty_prime', float64[:]),
+            ('saturation_mask', uint8[:]),
         )
 
     def params_to_dict(self):
@@ -1160,18 +1188,36 @@ class LeakyClippedQuadratic(BaseDatafit):
         return lipschitz
 
     def initialize(self, X, y):
-        n_features = X.shape[1]
+        n_samples, n_features = X.shape
         self.Xty_prime = np.zeros(n_features, dtype=X.dtype)
+        self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
+        for i in range(n_samples):
+            if y[i] >= self.b:
+                self.saturation_mask[i] = 1
+            elif y[i] <= self.a:
+                self.saturation_mask[i] = 2
+            else:
+                self.saturation_mask[i] = 0
+                
         for j in range(n_features):
             res = 0.
-            for i in range(len(y)):
-                yi = y[i]
-                res += X[i, j] * yi
+            for i in range(n_samples):
+                res += X[i, j] * y[i]
             self.Xty_prime[j] = res
 
     def initialize_sparse(self, X_data, X_indptr, X_indices, y):
+        n_samples = len(y)
         n_features = len(X_indptr) - 1
         self.Xty_prime = np.zeros(n_features, dtype=X_data.dtype)
+        self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
+        for i in range(n_samples):
+            if y[i] >= self.b:
+                self.saturation_mask[i] = 1
+            elif y[i] <= self.a:
+                self.saturation_mask[i] = 2
+            else:
+                self.saturation_mask[i] = 0
+                
         for j in range(n_features):
             res = 0.
             for i in range(X_indptr[j], X_indptr[j+1]):
@@ -1235,24 +1281,15 @@ class LeakyClippedQuadratic(BaseDatafit):
     def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
         n = len(Xw)
         val = 0.
-        if self.a <= -1e10:
-            for i in range(X_indptr[j], X_indptr[j+1]):
-                idx_i = X_indices[i]
-                zi = Xw[idx_i]
-                if zi > self.b:
-                    val += X_data[i] * self.alpha * (self.b + self.alpha * (zi - self.b) - y[idx_i])
-                else:
-                    val += X_data[i] * (zi - y[idx_i])
-        else:
-            for i in range(X_indptr[j], X_indptr[j+1]):
-                idx_i = X_indices[i]
-                zi = Xw[idx_i]
-                ci = self._leaky_clip(zi)
-                residual = ci - y[idx_i]
-                if zi < self.a or zi > self.b:
-                    val += X_data[i] * self.alpha * residual
-                else:
-                    val += X_data[i] * residual
+        for i in range(X_indptr[j], X_indptr[j+1]):
+            idx_i = X_indices[i]
+            zi = Xw[idx_i]
+            if zi < self.a:
+                val += X_data[i] * self.alpha * (self.a + self.alpha * (zi - self.a) - y[idx_i])
+            elif zi > self.b:
+                val += X_data[i] * self.alpha * (self.b + self.alpha * (zi - self.b) - y[idx_i])
+            else:
+                val += X_data[i] * (zi - y[idx_i])
         return val / n
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
@@ -1261,24 +1298,15 @@ class LeakyClippedQuadratic(BaseDatafit):
         grad = np.zeros(n_features, dtype=Xw.dtype)
         for j in range(n_features):
             res = 0.
-            if self.a <= -1e10:
-                for i in range(X_indptr[j], X_indptr[j+1]):
-                    idx_i = X_indices[i]
-                    zi = Xw[idx_i]
-                    if zi > self.b:
-                        res += X_data[i] * self.alpha * (self.b + self.alpha * (zi - self.b) - y[idx_i])
-                    else:
-                        res += X_data[i] * (zi - y[idx_i])
-            else:
-                for i in range(X_indptr[j], X_indptr[j+1]):
-                    idx_i = X_indices[i]
-                    zi = Xw[idx_i]
-                    ci = self._leaky_clip(zi)
-                    residual = ci - y[idx_i]
-                    if zi < self.a or zi > self.b:
-                        res += X_data[i] * self.alpha * residual
-                    else:
-                        res += X_data[i] * residual
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                idx_i = X_indices[i]
+                zi = Xw[idx_i]
+                if zi < self.a:
+                    res += X_data[i] * self.alpha * (self.a + self.alpha * (zi - self.a) - y[idx_i])
+                elif zi > self.b:
+                    res += X_data[i] * self.alpha * (self.b + self.alpha * (zi - self.b) - y[idx_i])
+                else:
+                    res += X_data[i] * (zi - y[idx_i])
             grad[j] = res / n
         return grad
 
@@ -1359,6 +1387,9 @@ class CensoredQuadratic(BaseDatafit):
         return (
             ('a', float64),
             ('b', float64),
+            ('Xty_prime', float64[:]),
+            ('saturation_mask', uint8[:]),
+            ('is_one_sided', bool_),
         )
 
     def params_to_dict(self):
@@ -1385,7 +1416,50 @@ class CensoredQuadratic(BaseDatafit):
         return lipschitz
 
     def initialize(self, X, y):
-        pass
+        n_samples, n_features = X.shape
+        self.is_one_sided = (self.a <= -1e11)
+        self.Xty_prime = np.zeros(n_features, dtype=X.dtype)
+        self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
+        y_clipped = np.zeros(n_samples, dtype=X.dtype)
+        
+        for i in range(n_samples):
+            if y[i] >= self.b:
+                self.saturation_mask[i] = 1
+                y_clipped[i] = self.b
+            elif y[i] <= self.a:
+                self.saturation_mask[i] = 2
+                y_clipped[i] = self.a
+            else:
+                self.saturation_mask[i] = 0
+                y_clipped[i] = y[i]
+                
+        for j in range(n_features):
+            self.Xty_prime[j] = X[:, j] @ y_clipped
+
+    def initialize_sparse(self, X_data, X_indptr, X_indices, y):
+        n_samples = len(y)
+        n_features = len(X_indptr) - 1
+        self.is_one_sided = (self.a <= -1e11)
+        self.Xty_prime = np.zeros(n_features, dtype=X_data.dtype)
+        self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
+        y_clipped = np.zeros(n_samples, dtype=X_data.dtype)
+        
+        for i in range(n_samples):
+            if y[i] >= self.b:
+                self.saturation_mask[i] = 1
+                y_clipped[i] = self.b
+            elif y[i] <= self.a:
+                self.saturation_mask[i] = 2
+                y_clipped[i] = self.a
+            else:
+                self.saturation_mask[i] = 0
+                y_clipped[i] = y[i]
+                
+        for j in range(n_features):
+            res = 0.
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                res += X_data[i] * y_clipped[X_indices[i]]
+            self.Xty_prime[j] = res
 
     def value(self, y, w, Xw):
         n = len(y)
@@ -1458,62 +1532,37 @@ class CensoredQuadratic(BaseDatafit):
 
     def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
         n = len(Xw)
-        val = 0.
-        # Fast path for one-sided upper saturation (common for sensors)
-        if self.a <= -1e10:
-            for i in range(X_indptr[j], X_indptr[j+1]):
-                idx_i = X_indices[i]
-                yi = y[idx_i]
-                if yi >= self.b:
-                    zi = Xw[idx_i]
-                    if zi < self.b:
-                        val += X_data[i] * (zi - self.b)
-                else:
-                    val += X_data[i] * (Xw[idx_i] - yi)
-        else:
-            for i in range(X_indptr[j], X_indptr[j+1]):
-                idx_i = X_indices[i]
-                zi = Xw[idx_i]
-                yi = y[idx_i]
-                if yi >= self.b:
-                    if zi < self.b:
-                        val += X_data[i] * (zi - self.b)
-                elif yi <= self.a:
-                    if zi > self.a:
-                        val += X_data[i] * (zi - self.a)
-                else:
-                    val += X_data[i] * (zi - yi)
-        return val / n
+        res = -self.Xty_prime[j]
+        for i in range(X_indptr[j], X_indptr[j+1]):
+            idx_i = X_indices[i]
+            zi = Xw[idx_i]
+            res += X_data[i] * zi
+            mask = self.saturation_mask[idx_i]
+            if mask == 1: # Upper
+                if zi >= self.b:
+                    res -= X_data[i] * (zi - self.b)
+            elif not self.is_one_sided and mask == 2: # Lower
+                if zi <= self.a:
+                    res -= X_data[i] * (zi - self.a)
+        return res / n
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
         n_features = len(X_indptr) - 1
         n = len(y)
         grad = np.zeros(n_features, dtype=Xw.dtype)
         for j in range(n_features):
-            res = 0.
-            if self.a <= -1e10:
-                for i in range(X_indptr[j], X_indptr[j+1]):
-                    idx_i = X_indices[i]
-                    yi = y[idx_i]
-                    if yi >= self.b:
-                        zi = Xw[idx_i]
-                        if zi < self.b:
-                            res += X_data[i] * (zi - self.b)
-                    else:
-                        res += X_data[i] * (Xw[idx_i] - yi)
-            else:
-                for i in range(X_indptr[j], X_indptr[j+1]):
-                    idx_i = X_indices[i]
-                    zi = Xw[idx_i]
-                    yi = y[idx_i]
-                    if yi >= self.b:
-                        if zi < self.b:
-                            res += X_data[i] * (zi - self.b)
-                    elif yi <= self.a:
-                        if zi > self.a:
-                            res += X_data[i] * (zi - self.a)
-                    else:
-                        res += X_data[i] * (zi - yi)
+            res = -self.Xty_prime[j]
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                idx_i = X_indices[i]
+                zi = Xw[idx_i]
+                res += X_data[i] * zi
+                mask = self.saturation_mask[idx_i]
+                if mask == 1:
+                    if zi >= self.b:
+                        res -= X_data[i] * (zi - self.b)
+                elif not self.is_one_sided and mask == 2:
+                    if zi <= self.a:
+                        res -= X_data[i] * (zi - self.a)
             grad[j] = res / n
         return grad
 
