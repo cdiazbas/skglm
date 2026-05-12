@@ -1037,11 +1037,18 @@ class ClippedQuadratic(BaseDatafit):
     def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
         n = len(Xw)
         val = 0.
-        for i in range(X_indptr[j], X_indptr[j+1]):
-            idx_i = X_indices[i]
-            zi = Xw[idx_i]
-            if self.a <= zi <= self.b:
-                val += X_data[i] * (zi - y[idx_i])
+        if self.a <= -1e10:
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                idx_i = X_indices[i]
+                zi = Xw[idx_i]
+                if zi <= self.b:
+                    val += X_data[i] * (zi - y[idx_i])
+        else:
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                idx_i = X_indices[i]
+                zi = Xw[idx_i]
+                if self.a <= zi <= self.b:
+                    val += X_data[i] * (zi - y[idx_i])
         return val / n
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
@@ -1061,10 +1068,16 @@ class ClippedQuadratic(BaseDatafit):
     def intercept_update_step(self, y, Xw):
         n = len(Xw)
         val = 0.
-        for i in range(n):
-            zi = Xw[i]
-            if self.a <= zi <= self.b:
-                val += (zi - y[i])
+        if self.a <= -1e10:
+            for i in range(n):
+                zi = Xw[i]
+                if zi <= self.b:
+                    val += (zi - y[i])
+        else:
+            for i in range(n):
+                zi = Xw[i]
+                if self.a <= zi <= self.b:
+                    val += (zi - y[i])
         return val / n
 
 
@@ -1195,15 +1208,24 @@ class LeakyClippedQuadratic(BaseDatafit):
     def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
         n = len(Xw)
         val = 0.
-        for i in range(X_indptr[j], X_indptr[j+1]):
-            idx_i = X_indices[i]
-            zi = Xw[idx_i]
-            ci = self._leaky_clip(zi)
-            residual = ci - y[idx_i]
-            if zi < self.a or zi > self.b:
-                val += X_data[i] * self.alpha * residual
-            else:
-                val += X_data[i] * residual
+        if self.a <= -1e10:
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                idx_i = X_indices[i]
+                zi = Xw[idx_i]
+                if zi > self.b:
+                    val += X_data[i] * self.alpha * (self.b + self.alpha * (zi - self.b) - y[idx_i])
+                else:
+                    val += X_data[i] * (zi - y[idx_i])
+        else:
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                idx_i = X_indices[i]
+                zi = Xw[idx_i]
+                ci = self._leaky_clip(zi)
+                residual = ci - y[idx_i]
+                if zi < self.a or zi > self.b:
+                    val += X_data[i] * self.alpha * residual
+                else:
+                    val += X_data[i] * residual
         return val / n
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
@@ -1223,14 +1245,22 @@ class LeakyClippedQuadratic(BaseDatafit):
     def intercept_update_step(self, y, Xw):
         n = len(Xw)
         val = 0.
-        for i in range(n):
-            zi = Xw[i]
-            ci = self._leaky_clip(zi)
-            residual = ci - y[i]
-            if zi < self.a or zi > self.b:
-                val += self.alpha * residual
-            else:
-                val += residual
+        if self.a <= -1e10:
+            for i in range(n):
+                zi = Xw[i]
+                if zi > self.b:
+                    val += self.alpha * (self.b + self.alpha * (zi - self.b) - y[i])
+                else:
+                    val += (zi - y[i])
+        else:
+            for i in range(n):
+                zi = Xw[i]
+                ci = self._leaky_clip(zi)
+                residual = ci - y[i]
+                if zi < self.a or zi > self.b:
+                    val += self.alpha * residual
+                else:
+                    val += residual
         return val / n
 
 
@@ -1386,18 +1416,30 @@ class CensoredQuadratic(BaseDatafit):
     def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
         n = len(Xw)
         val = 0.
-        for i in range(X_indptr[j], X_indptr[j+1]):
-            idx_i = X_indices[i]
-            zi = Xw[idx_i]
-            yi = y[idx_i]
-            if yi >= self.b:
-                if zi < self.b:
-                    val += X_data[i] * (zi - self.b)
-            elif yi <= self.a:
-                if zi > self.a:
-                    val += X_data[i] * (zi - self.a)
-            else:
-                val += X_data[i] * (zi - yi)
+        # Fast path for one-sided upper saturation (common for sensors)
+        if self.a <= -1e10:
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                idx_i = X_indices[i]
+                yi = y[idx_i]
+                if yi >= self.b:
+                    zi = Xw[idx_i]
+                    if zi < self.b:
+                        val += X_data[i] * (zi - self.b)
+                else:
+                    val += X_data[i] * (Xw[idx_i] - yi)
+        else:
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                idx_i = X_indices[i]
+                zi = Xw[idx_i]
+                yi = y[idx_i]
+                if yi >= self.b:
+                    if zi < self.b:
+                        val += X_data[i] * (zi - self.b)
+                elif yi <= self.a:
+                    if zi > self.a:
+                        val += X_data[i] * (zi - self.a)
+                else:
+                    val += X_data[i] * (zi - yi)
         return val / n
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
@@ -1417,15 +1459,25 @@ class CensoredQuadratic(BaseDatafit):
     def intercept_update_step(self, y, Xw):
         n = len(Xw)
         val = 0.
-        for i in range(n):
-            zi = Xw[i]
-            yi = y[i]
-            if yi >= self.b:
-                if zi < self.b:
-                    val += (zi - self.b)
-            elif yi <= self.a:
-                if zi > self.a:
-                    val += (zi - self.a)
-            else:
-                val += (zi - yi)
+        if self.a <= -1e10:
+            for i in range(n):
+                yi = y[i]
+                if yi >= self.b:
+                    zi = Xw[i]
+                    if zi < self.b:
+                        val += (zi - self.b)
+                else:
+                    val += (Xw[i] - yi)
+        else:
+            for i in range(n):
+                zi = Xw[i]
+                yi = y[i]
+                if yi >= self.b:
+                    if zi < self.b:
+                        val += (zi - self.b)
+                elif yi <= self.a:
+                    if zi > self.a:
+                        val += (zi - self.a)
+                else:
+                    val += (zi - yi)
         return val / n
