@@ -989,6 +989,16 @@ class ClippedQuadratic(BaseDatafit):
     def get_global_lipschitz(self, X, y):
         return norm(X, ord=2) ** 2 / len(y)
 
+    def get_lipschitz_sparse(self, X_data, X_indptr, X_indices, y):
+        n_features = len(X_indptr) - 1
+        lipschitz = np.zeros(n_features, dtype=X_data.dtype)
+        for j in range(n_features):
+            nrm2 = 0.
+            for idx in range(X_indptr[j], X_indptr[j + 1]):
+                nrm2 += X_data[idx] ** 2
+            lipschitz[j] = nrm2 / len(y)
+        return lipschitz
+
     def initialize(self, X, y):
         pass
 
@@ -1006,14 +1016,56 @@ class ClippedQuadratic(BaseDatafit):
                 grad[i] = (zi - y[i]) / n
         return grad
 
+    def raw_hessian(self, y, Xw):
+        """Compute Hessian of datafit w.r.t ``Xw``."""
+        n = len(y)
+        hessian = np.zeros(n, dtype=Xw.dtype)
+        for i in range(n):
+            if self.a <= Xw[i] <= self.b:
+                hessian[i] = 1 / n
+        return hessian
+
     def gradient_scalar(self, X, y, w, Xw, j):
-        return X[:, j] @ self.raw_grad(y, Xw)
+        n = len(Xw)
+        val = 0.
+        for i in range(n):
+            zi = Xw[i]
+            if self.a <= zi <= self.b:
+                val += X[i, j] * (zi - y[i])
+        return val / n
+
+    def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
+        n = len(Xw)
+        val = 0.
+        for i in range(X_indptr[j], X_indptr[j+1]):
+            idx_i = X_indices[i]
+            zi = Xw[idx_i]
+            if self.a <= zi <= self.b:
+                val += X_data[i] * (zi - y[idx_i])
+        return val / n
+
+    def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
+        n_features = len(X_indptr) - 1
+        grad = np.zeros(n_features, dtype=Xw.dtype)
+        raw_grad = self.raw_grad(y, Xw)
+        for j in range(n_features):
+            res = 0.
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                res += X_data[i] * raw_grad[X_indices[i]]
+            grad[j] = res
+        return grad
 
     def gradient(self, X, y, Xw):
         return X.T @ self.raw_grad(y, Xw)
 
     def intercept_update_step(self, y, Xw):
-        return np.sum(self.raw_grad(y, Xw))
+        n = len(Xw)
+        val = 0.
+        for i in range(n):
+            zi = Xw[i]
+            if self.a <= zi <= self.b:
+                val += (zi - y[i])
+        return val / n
 
 
 class LeakyClippedQuadratic(BaseDatafit):
@@ -1073,6 +1125,16 @@ class LeakyClippedQuadratic(BaseDatafit):
     def get_global_lipschitz(self, X, y):
         return norm(X, ord=2) ** 2 / len(y)
 
+    def get_lipschitz_sparse(self, X_data, X_indptr, X_indices, y):
+        n_features = len(X_indptr) - 1
+        lipschitz = np.zeros(n_features, dtype=X_data.dtype)
+        for j in range(n_features):
+            nrm2 = 0.
+            for idx in range(X_indptr[j], X_indptr[j + 1]):
+                nrm2 += X_data[idx] ** 2
+            lipschitz[j] = nrm2 / len(y)
+        return lipschitz
+
     def initialize(self, X, y):
         pass
 
@@ -1105,14 +1167,71 @@ class LeakyClippedQuadratic(BaseDatafit):
                 grad[i] = residual / n
         return grad
 
+    def raw_hessian(self, y, Xw):
+        """Compute Hessian of datafit w.r.t ``Xw``."""
+        n = len(y)
+        hessian = np.zeros(n, dtype=Xw.dtype)
+        for i in range(n):
+            zi = Xw[i]
+            if self.a <= zi <= self.b:
+                hessian[i] = 1 / n
+            else:
+                hessian[i] = (self.alpha ** 2) / n
+        return hessian
+
     def gradient_scalar(self, X, y, w, Xw, j):
-        return X[:, j] @ self.raw_grad(y, Xw)
+        n = len(Xw)
+        val = 0.
+        for i in range(n):
+            zi = Xw[i]
+            ci = self._leaky_clip(zi)
+            residual = ci - y[i]
+            if zi < self.a or zi > self.b:
+                val += X[i, j] * self.alpha * residual
+            else:
+                val += X[i, j] * residual
+        return val / n
+
+    def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
+        n = len(Xw)
+        val = 0.
+        for i in range(X_indptr[j], X_indptr[j+1]):
+            idx_i = X_indices[i]
+            zi = Xw[idx_i]
+            ci = self._leaky_clip(zi)
+            residual = ci - y[idx_i]
+            if zi < self.a or zi > self.b:
+                val += X_data[i] * self.alpha * residual
+            else:
+                val += X_data[i] * residual
+        return val / n
+
+    def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
+        n_features = len(X_indptr) - 1
+        grad = np.zeros(n_features, dtype=Xw.dtype)
+        raw_grad = self.raw_grad(y, Xw)
+        for j in range(n_features):
+            res = 0.
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                res += X_data[i] * raw_grad[X_indices[i]]
+            grad[j] = res
+        return grad
 
     def gradient(self, X, y, Xw):
         return X.T @ self.raw_grad(y, Xw)
 
     def intercept_update_step(self, y, Xw):
-        return np.sum(self.raw_grad(y, Xw))
+        n = len(Xw)
+        val = 0.
+        for i in range(n):
+            zi = Xw[i]
+            ci = self._leaky_clip(zi)
+            residual = ci - y[i]
+            if zi < self.a or zi > self.b:
+                val += self.alpha * residual
+            else:
+                val += residual
+        return val / n
 
 
 class CensoredQuadratic(BaseDatafit):
@@ -1182,6 +1301,16 @@ class CensoredQuadratic(BaseDatafit):
     def get_global_lipschitz(self, X, y):
         return norm(X, ord=2) ** 2 / len(y)
 
+    def get_lipschitz_sparse(self, X_data, X_indptr, X_indices, y):
+        n_features = len(X_indptr) - 1
+        lipschitz = np.zeros(n_features, dtype=X_data.dtype)
+        for j in range(n_features):
+            nrm2 = 0.
+            for idx in range(X_indptr[j], X_indptr[j + 1]):
+                nrm2 += X_data[idx] ** 2
+            lipschitz[j] = nrm2 / len(y)
+        return lipschitz
+
     def initialize(self, X, y):
         pass
 
@@ -1221,11 +1350,82 @@ class CensoredQuadratic(BaseDatafit):
                 grad[i] = (zi - yi) / n
         return grad
 
+    def raw_hessian(self, y, Xw):
+        """Compute Hessian of datafit w.r.t ``Xw``."""
+        n = len(y)
+        hessian = np.zeros(n, dtype=Xw.dtype)
+        for i in range(n):
+            zi = Xw[i]
+            yi = y[i]
+            if yi >= self.b:
+                if zi < self.b:
+                    hessian[i] = 1 / n
+            elif yi <= self.a:
+                if zi > self.a:
+                    hessian[i] = 1 / n
+            else:
+                hessian[i] = 1 / n
+        return hessian
+
     def gradient_scalar(self, X, y, w, Xw, j):
-        return X[:, j] @ self.raw_grad(y, Xw)
+        n = len(Xw)
+        val = 0.
+        for i in range(n):
+            zi = Xw[i]
+            yi = y[i]
+            if yi >= self.b:
+                if zi < self.b:
+                    val += X[i, j] * (zi - self.b)
+            elif yi <= self.a:
+                if zi > self.a:
+                    val += X[i, j] * (zi - self.a)
+            else:
+                val += X[i, j] * (zi - yi)
+        return val / n
+
+    def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
+        n = len(Xw)
+        val = 0.
+        for i in range(X_indptr[j], X_indptr[j+1]):
+            idx_i = X_indices[i]
+            zi = Xw[idx_i]
+            yi = y[idx_i]
+            if yi >= self.b:
+                if zi < self.b:
+                    val += X_data[i] * (zi - self.b)
+            elif yi <= self.a:
+                if zi > self.a:
+                    val += X_data[i] * (zi - self.a)
+            else:
+                val += X_data[i] * (zi - yi)
+        return val / n
+
+    def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
+        n_features = len(X_indptr) - 1
+        grad = np.zeros(n_features, dtype=Xw.dtype)
+        raw_grad = self.raw_grad(y, Xw)
+        for j in range(n_features):
+            res = 0.
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                res += X_data[i] * raw_grad[X_indices[i]]
+            grad[j] = res
+        return grad
 
     def gradient(self, X, y, Xw):
         return X.T @ self.raw_grad(y, Xw)
 
     def intercept_update_step(self, y, Xw):
-        return np.sum(self.raw_grad(y, Xw))
+        n = len(Xw)
+        val = 0.
+        for i in range(n):
+            zi = Xw[i]
+            yi = y[i]
+            if yi >= self.b:
+                if zi < self.b:
+                    val += (zi - self.b)
+            elif yi <= self.a:
+                if zi > self.a:
+                    val += (zi - self.a)
+            else:
+                val += (zi - yi)
+        return val / n
