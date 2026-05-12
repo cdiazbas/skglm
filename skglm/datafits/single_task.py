@@ -1053,13 +1053,23 @@ class ClippedQuadratic(BaseDatafit):
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
         n_features = len(X_indptr) - 1
+        n = len(y)
         grad = np.zeros(n_features, dtype=Xw.dtype)
-        raw_grad = self.raw_grad(y, Xw)
         for j in range(n_features):
             res = 0.
-            for i in range(X_indptr[j], X_indptr[j+1]):
-                res += X_data[i] * raw_grad[X_indices[i]]
-            grad[j] = res
+            if self.a <= -1e10:
+                for i in range(X_indptr[j], X_indptr[j+1]):
+                    idx_i = X_indices[i]
+                    zi = Xw[idx_i]
+                    if zi <= self.b:
+                        res += X_data[i] * (zi - y[idx_i])
+            else:
+                for i in range(X_indptr[j], X_indptr[j+1]):
+                    idx_i = X_indices[i]
+                    zi = Xw[idx_i]
+                    if self.a <= zi <= self.b:
+                        res += X_data[i] * (zi - y[idx_i])
+            grad[j] = res / n
         return grad
 
     def gradient(self, X, y, Xw):
@@ -1123,6 +1133,7 @@ class LeakyClippedQuadratic(BaseDatafit):
             ('a', float64),
             ('b', float64),
             ('alpha', float64),
+            ('Xty_prime', float64[:]),
         )
 
     def params_to_dict(self):
@@ -1149,7 +1160,23 @@ class LeakyClippedQuadratic(BaseDatafit):
         return lipschitz
 
     def initialize(self, X, y):
-        pass
+        n_features = X.shape[1]
+        self.Xty_prime = np.zeros(n_features, dtype=X.dtype)
+        for j in range(n_features):
+            res = 0.
+            for i in range(len(y)):
+                yi = y[i]
+                res += X[i, j] * yi
+            self.Xty_prime[j] = res
+
+    def initialize_sparse(self, X_data, X_indptr, X_indices, y):
+        n_features = len(X_indptr) - 1
+        self.Xty_prime = np.zeros(n_features, dtype=X_data.dtype)
+        for j in range(n_features):
+            res = 0.
+            for i in range(X_indptr[j], X_indptr[j+1]):
+                res += X_data[i] * y[X_indices[i]]
+            self.Xty_prime[j] = res
 
     def _leaky_clip(self, z):
         if z < self.a:
@@ -1230,13 +1257,29 @@ class LeakyClippedQuadratic(BaseDatafit):
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
         n_features = len(X_indptr) - 1
+        n = len(y)
         grad = np.zeros(n_features, dtype=Xw.dtype)
-        raw_grad = self.raw_grad(y, Xw)
         for j in range(n_features):
             res = 0.
-            for i in range(X_indptr[j], X_indptr[j+1]):
-                res += X_data[i] * raw_grad[X_indices[i]]
-            grad[j] = res
+            if self.a <= -1e10:
+                for i in range(X_indptr[j], X_indptr[j+1]):
+                    idx_i = X_indices[i]
+                    zi = Xw[idx_i]
+                    if zi > self.b:
+                        res += X_data[i] * self.alpha * (self.b + self.alpha * (zi - self.b) - y[idx_i])
+                    else:
+                        res += X_data[i] * (zi - y[idx_i])
+            else:
+                for i in range(X_indptr[j], X_indptr[j+1]):
+                    idx_i = X_indices[i]
+                    zi = Xw[idx_i]
+                    ci = self._leaky_clip(zi)
+                    residual = ci - y[idx_i]
+                    if zi < self.a or zi > self.b:
+                        res += X_data[i] * self.alpha * residual
+                    else:
+                        res += X_data[i] * residual
+            grad[j] = res / n
         return grad
 
     def gradient(self, X, y, Xw):
@@ -1444,13 +1487,34 @@ class CensoredQuadratic(BaseDatafit):
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
         n_features = len(X_indptr) - 1
+        n = len(y)
         grad = np.zeros(n_features, dtype=Xw.dtype)
-        raw_grad = self.raw_grad(y, Xw)
         for j in range(n_features):
             res = 0.
-            for i in range(X_indptr[j], X_indptr[j+1]):
-                res += X_data[i] * raw_grad[X_indices[i]]
-            grad[j] = res
+            if self.a <= -1e10:
+                for i in range(X_indptr[j], X_indptr[j+1]):
+                    idx_i = X_indices[i]
+                    yi = y[idx_i]
+                    if yi >= self.b:
+                        zi = Xw[idx_i]
+                        if zi < self.b:
+                            res += X_data[i] * (zi - self.b)
+                    else:
+                        res += X_data[i] * (Xw[idx_i] - yi)
+            else:
+                for i in range(X_indptr[j], X_indptr[j+1]):
+                    idx_i = X_indices[i]
+                    zi = Xw[idx_i]
+                    yi = y[idx_i]
+                    if yi >= self.b:
+                        if zi < self.b:
+                            res += X_data[i] * (zi - self.b)
+                    elif yi <= self.a:
+                        if zi > self.a:
+                            res += X_data[i] * (zi - self.a)
+                    else:
+                        res += X_data[i] * (zi - yi)
+            grad[j] = res / n
         return grad
 
     def gradient(self, X, y, Xw):
