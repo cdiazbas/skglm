@@ -1,6 +1,8 @@
 from .base import BaseDatafit, BaseMultitaskDatafit
 from .single_task import (Quadratic, QuadraticSVC, Logistic, Huber, Poisson, Gamma,
-                          Cox, WeightedQuadratic, QuadraticHessian,)
+                          Cox, WeightedQuadratic, QuadraticHessian,
+                          ClippedQuadratic, LeakyClippedQuadratic,
+                          CensoredQuadratic)
 from .multi_task import QuadraticMultiTask
 from .group import QuadraticGroup, LogisticGroup, PoissonGroup
 
@@ -10,5 +12,6 @@ __all__ = [
     Quadratic, QuadraticSVC, Logistic, Huber, Poisson, Gamma, Cox,
     QuadraticMultiTask,
     QuadraticGroup, LogisticGroup, PoissonGroup, WeightedQuadratic,
-    QuadraticHessian
+    QuadraticHessian,
+    ClippedQuadratic, LeakyClippedQuadratic, CensoredQuadratic,
 ]

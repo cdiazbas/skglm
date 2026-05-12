@@ -20,7 +20,8 @@ from sklearn.multiclass import OneVsRestClassifier, check_classification_targets
 from skglm.solvers import AndersonCD, MultiTaskBCD, GroupBCD, ProxNewton, LBFGS
 from skglm.datafits import (
     Cox, Quadratic, Logistic, QuadraticSVC,
-    QuadraticMultiTask, QuadraticGroup,)
+    QuadraticMultiTask, QuadraticGroup, ClippedQuadratic,
+    LeakyClippedQuadratic, CensoredQuadratic)
 from skglm.penalties import (L1, WeightedL1, L1_plus_L2, L2, WeightedGroupL2,
                              MCPenalty, WeightedMCPenalty, IndicatorBox, L2_1)
 from skglm.utils.data import grp_converter
@@ -435,6 +436,278 @@ class Lasso(RegressorMixin, LinearModel):
         """
         penalty = L1(self.alpha, self.positive)
         datafit = Quadratic()
+        solver = AndersonCD(
+            self.max_iter, self.max_epochs, self.p0, tol=self.tol,
+            ws_strategy=self.ws_strategy, fit_intercept=self.fit_intercept,
+            warm_start=self.warm_start, verbose=self.verbose)
+        return solver.path(X, y, datafit, penalty, alphas, coef_init, return_n_iter)
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.input_tags.sparse = True
+        return tags
+
+
+class ClippedLasso(RegressorMixin, LinearModel):
+    r"""Lasso estimator with strictly clipped predictions.
+
+    The optimization objective for ClippedLasso is:
+
+    .. math::
+        1 / (2 xx n_"samples")  ||y - clip(Xw, a, b)||_2 ^ 2 + alpha ||w||_1
+
+    Parameters
+    ----------
+    a : float, optional (default=-1.)
+        Lower bound of the clipping range.
+
+    b : float, optional (default=1.)
+        Upper bound of the clipping range.
+
+    alpha : float, optional (default=1.)
+        Penalty strength.
+
+    max_iter : int, optional (default=50)
+        The maximum number of iterations (subproblem definitions).
+
+    max_epochs : int (default=50,000)
+        Maximum number of CD epochs on each subproblem.
+
+    p0 : int (default=10)
+        First working set size.
+
+    verbose : bool or int (default=0)
+        Amount of verbosity.
+
+    tol : float, optional (default=1e-4)
+        Stopping criterion for the optimization.
+
+    positive : bool, optional (default=False)
+        When set to ``True``, forces the coefficient vector to be positive.
+
+    fit_intercept : bool, optional (default=True)
+        Whether or not to fit an intercept.
+
+    warm_start : bool, optional (default=False)
+        When set to ``True``, reuse the solution of the previous call to fit as
+        initialization, otherwise, just erase the previous solution.
+
+    ws_strategy : str (default="subdiff")
+        The score used to build the working set. Can be ``"fixpoint"`` or ``"subdiff"``.
+
+    Attributes
+    ----------
+    coef_ : array, shape (n_features,)
+        parameter vector (:math:`w` in the cost function formula)
+
+    intercept_ : float
+        constant term in decision function.
+
+    n_iter_ : int
+        Number of subproblems solved to reach the specified tolerance.
+    """
+
+    def __init__(self, a=-1., b=1., alpha=1., max_iter=50, max_epochs=50_000, p0=10,
+                 verbose=0, tol=1e-4, positive=False, fit_intercept=True,
+                 warm_start=False, ws_strategy="subdiff"):
+        super().__init__()
+        self.a = a
+        self.b = b
+        self.alpha = alpha
+        self.tol = tol
+        self.max_iter = max_iter
+        self.max_epochs = max_epochs
+        self.p0 = p0
+        self.ws_strategy = ws_strategy
+        self.positive = positive
+        self.fit_intercept = fit_intercept
+        self.warm_start = warm_start
+        self.verbose = verbose
+
+    def fit(self, X, y):
+        solver = AndersonCD(
+            self.max_iter, self.max_epochs, self.p0, tol=self.tol,
+            ws_strategy=self.ws_strategy, fit_intercept=self.fit_intercept,
+            warm_start=self.warm_start, verbose=self.verbose)
+        datafit = ClippedQuadratic(self.a, self.b)
+        penalty = L1(self.alpha, self.positive)
+        return _glm_fit(X, y, self, datafit, penalty, solver)
+
+    def path(self, X, y, alphas, coef_init=None, return_n_iter=True, **params):
+        penalty = L1(self.alpha, self.positive)
+        datafit = ClippedQuadratic(self.a, self.b)
+        solver = AndersonCD(
+            self.max_iter, self.max_epochs, self.p0, tol=self.tol,
+            ws_strategy=self.ws_strategy, fit_intercept=self.fit_intercept,
+            warm_start=self.warm_start, verbose=self.verbose)
+        return solver.path(X, y, datafit, penalty, alphas, coef_init, return_n_iter)
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.input_tags.sparse = True
+        return tags
+
+
+class LeakyClippedLasso(RegressorMixin, LinearModel):
+    r"""Lasso estimator with leaky clipped predictions.
+
+    Parameters
+    ----------
+    a : float, optional (default=-1.)
+        Lower bound of the clipping range.
+
+    b : float, optional (default=1.)
+        Upper bound of the clipping range.
+
+    alpha_leak : float, optional (default=0.1)
+        Leakage slope outside ``[a, b]``.
+
+    alpha : float, optional (default=1.)
+        Penalty strength.
+
+    max_iter : int, optional (default=50)
+        The maximum number of iterations (subproblem definitions).
+
+    max_epochs : int (default=50,000)
+        Maximum number of CD epochs on each subproblem.
+
+    p0 : int (default=10)
+        First working set size.
+
+    verbose : bool or int (default=0)
+        Amount of verbosity.
+
+    tol : float, optional (default=1e-4)
+        Stopping criterion for the optimization.
+
+    positive : bool, optional (default=False)
+        When set to ``True``, forces the coefficient vector to be positive.
+
+    fit_intercept : bool, optional (default=True)
+        Whether or not to fit an intercept.
+
+    warm_start : bool, optional (default=False)
+        When set to ``True``, reuse the solution of the previous call to fit as
+        initialization, otherwise, just erase the previous solution.
+
+    ws_strategy : str (default="subdiff")
+        The score used to build the working set. Can be ``"fixpoint"`` or ``"subdiff"``.
+    """
+
+    def __init__(self, a=-1., b=1., alpha_leak=0.1, alpha=1., max_iter=50,
+                 max_epochs=50_000, p0=10, verbose=0, tol=1e-4, positive=False,
+                 fit_intercept=True, warm_start=False, ws_strategy="subdiff"):
+        super().__init__()
+        self.a = a
+        self.b = b
+        self.alpha_leak = alpha_leak
+        self.alpha = alpha
+        self.tol = tol
+        self.max_iter = max_iter
+        self.max_epochs = max_epochs
+        self.p0 = p0
+        self.ws_strategy = ws_strategy
+        self.positive = positive
+        self.fit_intercept = fit_intercept
+        self.warm_start = warm_start
+        self.verbose = verbose
+
+    def fit(self, X, y):
+        solver = AndersonCD(
+            self.max_iter, self.max_epochs, self.p0, tol=self.tol,
+            ws_strategy=self.ws_strategy, fit_intercept=self.fit_intercept,
+            warm_start=self.warm_start, verbose=self.verbose)
+        datafit = LeakyClippedQuadratic(self.a, self.b, self.alpha_leak)
+        penalty = L1(self.alpha, self.positive)
+        return _glm_fit(X, y, self, datafit, penalty, solver)
+
+    def path(self, X, y, alphas, coef_init=None, return_n_iter=True, **params):
+        penalty = L1(self.alpha, self.positive)
+        datafit = LeakyClippedQuadratic(self.a, self.b, self.alpha_leak)
+        solver = AndersonCD(
+            self.max_iter, self.max_epochs, self.p0, tol=self.tol,
+            ws_strategy=self.ws_strategy, fit_intercept=self.fit_intercept,
+            warm_start=self.warm_start, verbose=self.verbose)
+        return solver.path(X, y, datafit, penalty, alphas, coef_init, return_n_iter)
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.input_tags.sparse = True
+        return tags
+
+
+class CensoredLasso(RegressorMixin, LinearModel):
+    r"""Lasso estimator for censored data (Tobit regression).
+
+    Parameters
+    ----------
+    a : float, optional (default=-1.)
+        Lower bound of the censoring range.
+
+    b : float, optional (default=1.)
+        Upper bound of the censoring range.
+
+    alpha : float, optional (default=1.)
+        Penalty strength.
+
+    max_iter : int, optional (default=50)
+        The maximum number of iterations (subproblem definitions).
+
+    max_epochs : int (default=50,000)
+        Maximum number of CD epochs on each subproblem.
+
+    p0 : int (default=10)
+        First working set size.
+
+    verbose : bool or int (default=0)
+        Amount of verbosity.
+
+    tol : float, optional (default=1e-4)
+        Stopping criterion for the optimization.
+
+    positive : bool, optional (default=False)
+        When set to ``True``, forces the coefficient vector to be positive.
+
+    fit_intercept : bool, optional (default=True)
+        Whether or not to fit an intercept.
+
+    warm_start : bool, optional (default=False)
+        When set to ``True``, reuse the solution of the previous call to fit as
+        initialization, otherwise, just erase the previous solution.
+
+    ws_strategy : str (default="subdiff")
+        The score used to build the working set. Can be ``"fixpoint"`` or ``"subdiff"``.
+    """
+
+    def __init__(self, a=-1., b=1., alpha=1., max_iter=50, max_epochs=50_000, p0=10,
+                 verbose=0, tol=1e-4, positive=False, fit_intercept=True,
+                 warm_start=False, ws_strategy="subdiff"):
+        super().__init__()
+        self.a = a
+        self.b = b
+        self.alpha = alpha
+        self.tol = tol
+        self.max_iter = max_iter
+        self.max_epochs = max_epochs
+        self.p0 = p0
+        self.ws_strategy = ws_strategy
+        self.positive = positive
+        self.fit_intercept = fit_intercept
+        self.warm_start = warm_start
+        self.verbose = verbose
+
+    def fit(self, X, y):
+        solver = AndersonCD(
+            self.max_iter, self.max_epochs, self.p0, tol=self.tol,
+            ws_strategy=self.ws_strategy, fit_intercept=self.fit_intercept,
+            warm_start=self.warm_start, verbose=self.verbose)
+        datafit = CensoredQuadratic(self.a, self.b)
+        penalty = L1(self.alpha, self.positive)
+        return _glm_fit(X, y, self, datafit, penalty, solver)
+
+    def path(self, X, y, alphas, coef_init=None, return_n_iter=True, **params):
+        penalty = L1(self.alpha, self.positive)
+        datafit = CensoredQuadratic(self.a, self.b)
         solver = AndersonCD(
             self.max_iter, self.max_epochs, self.p0, tol=self.tol,
             ws_strategy=self.ws_strategy, fit_intercept=self.fit_intercept,

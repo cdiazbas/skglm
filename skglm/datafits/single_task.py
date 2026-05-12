@@ -934,3 +934,298 @@ class Cox(BaseDatafit):
         indptr.append(n_indices)
 
         return np.asarray(indptr, dtype=np.int64)
+
+
+class ClippedQuadratic(BaseDatafit):
+    """Quadratic datafit with clipped (saturated) predictions.
+
+    The forward model is :math:`\\hat{y}_i = \\text{clip}(X_i^\\top w, a, b)`,
+    so the datafit reads:
+
+    .. math::
+
+        L(w) = \\frac{1}{2n} \\sum_{i=1}^n
+            (y_i - \\text{clip}(X_i^\\top w, a, b))^2
+
+    Gradients vanish for samples whose linear predictor lies outside ``[a, b]``
+    (strict saturation). See :class:`LeakyClippedQuadratic` for a variant that
+    preserves a small gradient in the saturated region, and
+    :class:`CensoredQuadratic` for the convex, theoretically optimal approach.
+
+    Parameters
+    ----------
+    a : float
+        Lower bound of the clipping range.
+    b : float
+        Upper bound of the clipping range.
+
+    Notes
+    -----
+    The class is jit compiled at fit time using Numba compiler.
+    The Lipschitz constant equals that of the plain :class:`Quadratic`
+    datafit because :math:`f''(z) \\in \\{0, 1\\}` everywhere.
+    """
+
+    def __init__(self, a, b):
+        self.a = float(a)
+        self.b = float(b)
+
+    def get_spec(self):
+        return (
+            ('a', float64),
+            ('b', float64),
+        )
+
+    def params_to_dict(self):
+        return dict(a=self.a, b=self.b)
+
+    def get_lipschitz(self, X, y):
+        n_features = X.shape[1]
+        lipschitz = np.zeros(n_features, dtype=X.dtype)
+        for j in range(n_features):
+            lipschitz[j] = (X[:, j] ** 2).sum() / len(y)
+        return lipschitz
+
+    def get_global_lipschitz(self, X, y):
+        return norm(X, ord=2) ** 2 / len(y)
+
+    def initialize(self, X, y):
+        pass
+
+    def value(self, y, w, Xw):
+        clipped = np.clip(Xw, self.a, self.b)
+        return np.sum((y - clipped) ** 2) / (2 * len(Xw))
+
+    def raw_grad(self, y, Xw):
+        """Compute per-sample gradient of the loss w.r.t. ``Xw``."""
+        n = len(y)
+        grad = np.zeros(n, dtype=Xw.dtype)
+        for i in range(n):
+            zi = Xw[i]
+            if self.a <= zi <= self.b:
+                grad[i] = (zi - y[i]) / n
+        return grad
+
+    def gradient_scalar(self, X, y, w, Xw, j):
+        return X[:, j] @ self.raw_grad(y, Xw)
+
+    def gradient(self, X, y, Xw):
+        return X.T @ self.raw_grad(y, Xw)
+
+    def intercept_update_step(self, y, Xw):
+        return np.sum(self.raw_grad(y, Xw))
+
+
+class LeakyClippedQuadratic(BaseDatafit):
+    """Quadratic datafit with leaky clipped (saturated) predictions.
+
+    Like :class:`ClippedQuadratic`, but outside the clipping range ``[a, b]``
+    a small slope ``alpha`` is applied so that gradients never vanish:
+
+    .. math::
+
+        \\text{clip}_{\\text{leaky}}(z, a, b, \\alpha) = \\begin{cases}
+            a + \\alpha(z - a) & z < a \\\\
+            z                  & a \\le z \\le b \\\\
+            b + \\alpha(z - b) & z > b
+        \\end{cases}
+
+    Parameters
+    ----------
+    a : float
+        Lower bound of the clipping range.
+    b : float
+        Upper bound of the clipping range.
+    alpha : float, default=0.1
+        Leakage slope applied outside ``[a, b]``. Must satisfy
+        ``0 < alpha < 1``.
+
+    Notes
+    -----
+    The Lipschitz constant equals that of the plain :class:`Quadratic`
+    datafit: the second derivative is :math:`\\alpha^2 \\le 1` outside the
+    clipping range and 1 inside, so the standard OLS bound
+    :math:`L_j = \\frac{1}{n}\\|X_{:,j}\\|^2` remains valid.
+    """
+
+    def __init__(self, a, b, alpha=0.1):
+        self.a = float(a)
+        self.b = float(b)
+        self.alpha = float(alpha)
+
+    def get_spec(self):
+        return (
+            ('a', float64),
+            ('b', float64),
+            ('alpha', float64),
+        )
+
+    def params_to_dict(self):
+        return dict(a=self.a, b=self.b, alpha=self.alpha)
+
+    def get_lipschitz(self, X, y):
+        n_features = X.shape[1]
+        lipschitz = np.zeros(n_features, dtype=X.dtype)
+        for j in range(n_features):
+            lipschitz[j] = (X[:, j] ** 2).sum() / len(y)
+        return lipschitz
+
+    def get_global_lipschitz(self, X, y):
+        return norm(X, ord=2) ** 2 / len(y)
+
+    def initialize(self, X, y):
+        pass
+
+    def _leaky_clip(self, z):
+        if z < self.a:
+            return self.a + self.alpha * (z - self.a)
+        elif z > self.b:
+            return self.b + self.alpha * (z - self.b)
+        return z
+
+    def value(self, y, w, Xw):
+        n = len(y)
+        total = 0.
+        for i in range(n):
+            c = self._leaky_clip(Xw[i])
+            total += (y[i] - c) ** 2
+        return total / (2 * n)
+
+    def raw_grad(self, y, Xw):
+        """Compute per-sample gradient of the loss w.r.t. ``Xw``."""
+        n = len(y)
+        grad = np.zeros(n, dtype=Xw.dtype)
+        for i in range(n):
+            zi = Xw[i]
+            ci = self._leaky_clip(zi)
+            residual = ci - y[i]
+            if zi < self.a or zi > self.b:
+                grad[i] = self.alpha * residual / n
+            else:
+                grad[i] = residual / n
+        return grad
+
+    def gradient_scalar(self, X, y, w, Xw, j):
+        return X[:, j] @ self.raw_grad(y, Xw)
+
+    def gradient(self, X, y, Xw):
+        return X.T @ self.raw_grad(y, Xw)
+
+    def intercept_update_step(self, y, Xw):
+        return np.sum(self.raw_grad(y, Xw))
+
+
+class CensoredQuadratic(BaseDatafit):
+    """Censored regression (Tobit) datafit for saturated observations.
+
+    Models the data-generation process where observed targets are clipped by
+    a sensor: :math:`y_i = \\text{clip}(z_i^*, a, b)`, where :math:`z_i^*`
+    is the latent signal and :math:`z_i = X_i^\\top w` is the linear
+    predictor.  Rather than clipping the prediction, the loss is conditioned
+    on the observed target value:
+
+    .. math::
+
+        f_i(z_i) = \\begin{cases}
+            \\frac{1}{2}(z_i - y_i)^2         & a < y_i < b \\\\
+            \\frac{1}{2}\\max(0, b - z_i)^2   & y_i \\ge b \\\\
+            \\frac{1}{2}\\max(0, z_i - a)^2   & y_i \\le a
+        \\end{cases}
+
+    This is the optimal (maximum-likelihood) loss for censored data and is
+    the recommended choice over :class:`ClippedQuadratic` and
+    :class:`LeakyClippedQuadratic`.
+
+    Parameters
+    ----------
+    a : float
+        Lower saturation bound.
+    b : float
+        Upper saturation bound.
+
+    Notes
+    -----
+    The loss is a convex piecewise quadratic, so Coordinate Descent is
+    guaranteed to converge to the global optimum.  The gradient is zero only
+    when the prediction correctly satisfies the censoring constraint
+    (:math:`z_i \\ge b` for upper-saturated samples, :math:`z_i \\le a`
+    for lower-saturated ones), avoiding the vanishing-gradient issue of
+    :class:`ClippedQuadratic`.
+
+    The Hessian :math:`f_i''(z_i) \\in \\{0, 1\\}` everywhere, so the
+    Lipschitz constants are identical to the plain :class:`Quadratic`
+    datafit: :math:`L_j = \\frac{1}{n}\\|X_{:,j}\\|^2`.
+
+    The class is jit compiled at fit time using Numba.
+    """
+
+    def __init__(self, a, b):
+        self.a = float(a)
+        self.b = float(b)
+
+    def get_spec(self):
+        return (
+            ('a', float64),
+            ('b', float64),
+        )
+
+    def params_to_dict(self):
+        return dict(a=self.a, b=self.b)
+
+    def get_lipschitz(self, X, y):
+        n_features = X.shape[1]
+        lipschitz = np.zeros(n_features, dtype=X.dtype)
+        for j in range(n_features):
+            lipschitz[j] = (X[:, j] ** 2).sum() / len(y)
+        return lipschitz
+
+    def get_global_lipschitz(self, X, y):
+        return norm(X, ord=2) ** 2 / len(y)
+
+    def initialize(self, X, y):
+        pass
+
+    def value(self, y, w, Xw):
+        n = len(y)
+        total = 0.
+        for i in range(n):
+            zi = Xw[i]
+            yi = y[i]
+            if yi >= self.b:
+                diff = zi - self.b
+                if diff < 0.:
+                    total += 0.5 * diff * diff
+            elif yi <= self.a:
+                diff = zi - self.a
+                if diff > 0.:
+                    total += 0.5 * diff * diff
+            else:
+                diff = zi - yi
+                total += 0.5 * diff * diff
+        return total / n
+
+    def raw_grad(self, y, Xw):
+        """Compute per-sample gradient of the loss w.r.t. ``Xw``."""
+        n = len(y)
+        grad = np.zeros(n, dtype=Xw.dtype)
+        for i in range(n):
+            zi = Xw[i]
+            yi = y[i]
+            if yi >= self.b:
+                if zi < self.b:
+                    grad[i] = (zi - self.b) / n
+            elif yi <= self.a:
+                if zi > self.a:
+                    grad[i] = (zi - self.a) / n
+            else:
+                grad[i] = (zi - yi) / n
+        return grad
+
+    def gradient_scalar(self, X, y, w, Xw, j):
+        return X[:, j] @ self.raw_grad(y, Xw)
+
+    def gradient(self, X, y, Xw):
+        return X.T @ self.raw_grad(y, Xw)
+
+    def intercept_update_step(self, y, Xw):
+        return np.sum(self.raw_grad(y, Xw))
