@@ -507,7 +507,7 @@ class ClippedLasso(RegressorMixin, LinearModel):
         Number of subproblems solved to reach the specified tolerance.
     """
 
-    def __init__(self, a=-1., b=1., alpha=1., max_iter=50, max_epochs=50_000, p0=10,
+    def __init__(self, a=-np.inf, b=np.inf, alpha=1., max_iter=50, max_epochs=50_000, p0=10,
                  verbose=0, tol=1e-4, positive=False, fit_intercept=True,
                  warm_start=False, ws_strategy="subdiff"):
         super().__init__()
@@ -594,7 +594,7 @@ class LeakyClippedLasso(RegressorMixin, LinearModel):
         The score used to build the working set. Can be ``"fixpoint"`` or ``"subdiff"``.
     """
 
-    def __init__(self, a=-1., b=1., alpha_leak=0.1, alpha=1., max_iter=50,
+    def __init__(self, a=-np.inf, b=np.inf, alpha_leak=0.1, alpha=1., max_iter=50,
                  max_epochs=50_000, p0=10, verbose=0, tol=1e-4, positive=False,
                  fit_intercept=True, warm_start=False, ws_strategy="subdiff"):
         super().__init__()
@@ -679,7 +679,7 @@ class CensoredLasso(RegressorMixin, LinearModel):
         The score used to build the working set. Can be ``"fixpoint"`` or ``"subdiff"``.
     """
 
-    def __init__(self, a=-1., b=1., alpha=1., max_iter=50, max_epochs=50_000, p0=10,
+    def __init__(self, a=-np.inf, b=np.inf, alpha=1., max_iter=50, max_epochs=50_000, p0=10,
                  verbose=0, tol=1e-4, positive=False, fit_intercept=True,
                  warm_start=False, ws_strategy="subdiff"):
         super().__init__()
