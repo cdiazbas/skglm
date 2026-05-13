@@ -30,6 +30,9 @@ from sklearn.utils.validation import validate_data
 
 
 def _glm_fit(X, y, model, datafit, penalty, solver):
+    import time
+    t_start = time.perf_counter()
+
     is_classif = isinstance(datafit, (Logistic, QuadraticSVC))
     fit_intercept = solver.fit_intercept
 
@@ -124,14 +127,21 @@ def _glm_fit(X, y, model, datafit, penalty, solver):
             w = np.zeros((n_features + fit_intercept, y.shape[1]), dtype=X_.dtype)
             Xw = np.zeros(y.shape, dtype=X_.dtype)
 
-    # check consistency of weights for WeightedL1
     if isinstance(penalty, WeightedL1):
         if len(penalty.weights) != n_features:
             raise ValueError(
                 "The size of the WeightedL1 penalty weights should be n_features, "
                 "expected %i, got %i." % (X_.shape[1], len(penalty.weights)))
 
+    t_val = time.perf_counter() - t_start
+    t0 = time.perf_counter()
+
     coefs, p_obj, kkt = solver.solve(X_, y, datafit, penalty, w, Xw)
+    
+    t_solve = time.perf_counter() - t0
+    if getattr(model, "verbose_debug", False):
+        t_total = time.perf_counter() - t_start
+        print(f"[Classic Lasso DEBUG] Validation: {t_val:.3f}s | Solve+Warmup: {t_solve:.3f}s | Total: {t_total:.3f}s")
     model.coef_, model.stop_crit_ = coefs[:n_features], kkt
     if y.ndim == 1:
         model.intercept_ = coefs[-1] if fit_intercept else 0.
@@ -360,7 +370,7 @@ class Lasso(RegressorMixin, LinearModel):
 
     def __init__(self, alpha=1., max_iter=50, max_epochs=50_000, p0=10, verbose=0,
                  tol=1e-4, positive=False, fit_intercept=True, warm_start=False,
-                 ws_strategy="subdiff"):
+                 ws_strategy="subdiff", verbose_debug=False):
         super().__init__()
         self.alpha = alpha
         self.tol = tol
@@ -372,6 +382,7 @@ class Lasso(RegressorMixin, LinearModel):
         self.fit_intercept = fit_intercept
         self.warm_start = warm_start
         self.verbose = verbose
+        self.verbose_debug = verbose_debug
 
     def fit(self, X, y):
         """Fit the model according to the given training data.
@@ -811,7 +822,7 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
 
     def __init__(self, alpha=1.0, max_iter=50, max_epochs=50_000, p0=10,
                  tol=1e-4, positive=False, fit_intercept=True,
-                 ws_strategy="subdiff"):
+                 ws_strategy="subdiff", verbose_debug=False):
         self.alpha = alpha
         self.max_iter = max_iter
         self.max_epochs = max_epochs
@@ -820,6 +831,7 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
         self.positive = positive
         self.fit_intercept = fit_intercept
         self.ws_strategy = ws_strategy
+        self.verbose_debug = verbose_debug
 
         # Cache state — populated on first fit, reused when X is the same
         self.X_ = None
@@ -866,31 +878,25 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
             fit_intercept=self.fit_intercept, warm_start=False, verbose=0)
 
     def fit(self, X, y, force_recompute=False):
-        """Fit the model, using cached X-state when possible.
+        """Fit the model, using cached X-state when possible."""
+        import time
+        t_start = time.perf_counter()
 
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-            Design matrix.
+        t0 = time.perf_counter()
+        is_same = self._is_same_X(X)
+        t_check = time.perf_counter() - t0
 
-        y : array-like of shape (n_samples,)
-            Target values.
-
-        force_recompute : bool, default=False
-            Force rebuilding the X cache even if X appears unchanged.
-            Use this if you have modified X in-place.
-
-        Returns
-        -------
-        self : LassoFastLoop
-            Fitted estimator.
-        """
-        if force_recompute or not self._is_same_X(X):
+        t_warmup = 0.0
+        if force_recompute or not is_same:
+            t0 = time.perf_counter()
             self._warm_up(X)
+            t_warmup = time.perf_counter() - t0
 
         y = np.ascontiguousarray(y, dtype=np.float64)
+        t0 = time.perf_counter()
         w, _, _ = self._solver._solve(
             self.X_, y, self._datafit, self._penalty)
+        t_solve = time.perf_counter() - t0
 
         if self.fit_intercept:
             self.coef_ = w[:-1]
@@ -898,6 +904,13 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
         else:
             self.coef_ = w
             self.intercept_ = 0.
+
+        t_total = time.perf_counter() - t_start
+        if self.verbose_debug:
+            cache_status = "MISS" if force_recompute or not is_same else "HIT "
+            print(f"[FastLoop DEBUG] Cache: {cache_status} | "
+                  f"Check: {t_check*1000:.2f}ms | Warmup: {t_warmup:.3f}s | "
+                  f"Solve: {t_solve:.3f}s | Total: {t_total:.3f}s")
 
         return self
 
