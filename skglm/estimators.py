@@ -141,7 +141,8 @@ def _glm_fit(X, y, model, datafit, penalty, solver):
     t_solve = time.perf_counter() - t0
     if getattr(model, "verbose_debug", False):
         t_total = time.perf_counter() - t_start
-        print(f"[Classic Lasso DEBUG] Validation: {t_val:.3f}s | Solve+Warmup: {t_solve:.3f}s | Total: {t_total:.3f}s")
+        import sys
+        sys.stderr.write(f"[Classic Lasso DEBUG] Validation: {t_val:.3f}s | Solve+Warmup: {t_solve:.3f}s | Total: {t_total:.3f}s\n")
     model.coef_, model.stop_crit_ = coefs[:n_features], kkt
     if y.ndim == 1:
         model.intercept_ = coefs[-1] if fit_intercept else 0.
@@ -908,9 +909,10 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
         t_total = time.perf_counter() - t_start
         if self.verbose_debug:
             cache_status = "MISS" if force_recompute or not is_same else "HIT "
-            print(f"[FastLoop DEBUG] Cache: {cache_status} | "
-                  f"Check: {t_check*1000:.2f}ms | Warmup: {t_warmup:.3f}s | "
-                  f"Solve: {t_solve:.3f}s | Total: {t_total:.3f}s")
+            import sys
+            sys.stderr.write(f"[FastLoop DEBUG] Cache: {cache_status} | "
+                             f"Check: {t_check*1000:.2f}ms | Warmup: {t_warmup:.3f}s | "
+                             f"Solve: {t_solve:.3f}s | Total: {t_total:.3f}s\n")
 
         return self
 
