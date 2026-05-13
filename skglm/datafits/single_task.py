@@ -1086,11 +1086,12 @@ class ClippedQuadratic(BaseDatafit):
 class LeakyClippedQuadratic(BaseDatafit):
     """Censored regression datafit with leaky slope past the saturation boundary.
 
-    Extends :class:`CensoredQuadratic` by adding a small gradient when the
-    linear predictor overshoots the saturation boundary.  Where
-    :class:`CensoredQuadratic` has zero gradient for
-    :math:`z_i > b` (upper-saturated) or :math:`z_i < a` (lower-saturated),
-    this datafit applies a slope ``alpha``, preventing dead zones:
+    Extends :class:`CensoredQuadratic` with a small penalty slope ``alpha``
+    applied when the linear predictor *overshoots* the saturation boundary.
+    Where :class:`CensoredQuadratic` has zero gradient once the predictor
+    satisfies the censoring constraint (:math:`z_i \\ge b` or :math:`z_i \\le a`),
+    this datafit retains a small signal to prevent any potential dead zones
+    at very high saturation rates:
 
     .. math::
 
@@ -1105,19 +1106,17 @@ class LeakyClippedQuadratic(BaseDatafit):
                 & y_i \\le a
         \\end{cases}
 
-    The per-sample gradient equals :math:`z_i^{\\text{eff}} - y_i^{\\text{clip}}`
-    where :math:`y_i^{\\text{clip}} = \\text{clip}(y_i, a, b)` (precomputed) and:
+    Unlike the naive leaky-clipping formulation (which clips the *prediction*
+    and compares to :math:`y_i`, introducing systematic bias), this loss is
+    grounded in the correct censored-data model.  The per-sample gradient is:
 
     .. math::
 
-        z_i^{\\text{eff}} = \\alpha z_i + (1-\\alpha)\\,\\text{clamp}_i(z_i)
+        f_i'(z_i) = z_i^{\\text{eff}} - y_i^{\\text{clip}}
 
-    with :math:`\\text{clamp}_i(z) = \\min(z, b)` for upper-saturated samples,
-    :math:`\\max(z, a)` for lower-saturated, and :math:`z` for linear ones.
-
-    This formulation correctly models censored data (like :class:`CensoredQuadratic`)
-    while guaranteeing non-zero gradients everywhere (unlike plain Censored where
-    the gradient vanishes once the predictor satisfies the censoring constraint).
+    where :math:`y_i^{\\text{clip}} = \\text{clip}(y_i, a, b)` is precomputed
+    and :math:`z_i^{\\text{eff}} = \\alpha z_i + (1-\\alpha)\\,\\text{clamp}_i(z_i)`
+    blends the raw predictor with its censored counterpart.
 
     Parameters
     ----------
@@ -1127,13 +1126,23 @@ class LeakyClippedQuadratic(BaseDatafit):
         Upper saturation bound.
     alpha : float, default=0.1
         Leakage slope applied when the predictor overshoots the boundary.
-        Must satisfy ``0 < alpha < 1``.
+        Must satisfy ``0 < alpha < 1``.  At ``alpha=0`` this reduces to
+        :class:`CensoredQuadratic`; at ``alpha=1`` to :class:`Quadratic`.
 
     Notes
     -----
+    The loss is **convex** (sum of two non-negative quadratic terms), so
+    Coordinate Descent is guaranteed to converge to the global optimum.
+
     The Lipschitz constant is identical to :class:`Quadratic`: the second
     derivative is in :math:`\\{\\alpha, 1\\}` everywhere, so
     :math:`L_j = \\frac{1}{n}\\|X_{:,j}\\|^2` remains valid.
+
+    At low saturation rates the leaky term adds a small bias (the predictor
+    is pulled back from the correct overshoot direction), so
+    :class:`CensoredQuadratic` is preferred when saturation is sparse.
+    Use this class when saturation is heavy (> ~50%) and gradient dead zones
+    are a practical concern.
 
     The class is jit compiled at fit time using Numba.
     """
@@ -1249,20 +1258,19 @@ class LeakyClippedQuadratic(BaseDatafit):
         return total / n
 
     def raw_grad(self, y, Xw):
-        """Per-sample gradient: z_clamp + epsilon_nudge - y_clipped."""
+        """Per-sample gradient: z_clamp + alpha_nudge - y_clipped."""
         n = len(y)
         grad = np.zeros(n, dtype=Xw.dtype)
-        epsilon = 1e-4
         for i in range(n):
             zi = Xw[i]
             mask = self.saturation_mask[i]
             if mask == 1:
                 z_clamp = min(zi, self.b)
-                nudge = epsilon if zi > self.b else 0.
+                nudge = self.alpha if zi > self.b else 0.
                 grad[i] = (z_clamp + nudge - self.b) / n
             elif mask == 2:
                 z_clamp = max(zi, self.a)
-                nudge = -epsilon if zi < self.a else 0.
+                nudge = -self.alpha if zi < self.a else 0.
                 grad[i] = (z_clamp + nudge - self.a) / n
             else:
                 grad[i] = (zi - y[i]) / n
@@ -1278,21 +1286,20 @@ class LeakyClippedQuadratic(BaseDatafit):
         return hessian
 
     def gradient_scalar(self, X, y, w, Xw, j):
-        """Dense path: index-partitioned, Epsilon-nudge logic."""
+        """Dense path: index-partitioned, alpha-nudge logic."""
         n = len(Xw)
         res = -self.Xty_prime[j]
-        epsilon = 1e-4
         for i in self.idx_linear:
             res += X[i, j] * Xw[i]
         for i in self.idx_upper:
             zi = Xw[i]
             z_clamp = min(zi, self.b)
-            nudge = epsilon if zi > self.b else 0.
+            nudge = self.alpha if zi > self.b else 0.
             res += X[i, j] * (z_clamp + nudge)
         for i in self.idx_lower:
             zi = Xw[i]
             z_clamp = max(zi, self.a)
-            nudge = -epsilon if zi < self.a else 0.
+            nudge = -self.alpha if zi < self.a else 0.
             res += X[i, j] * (z_clamp + nudge)
         return res / n
 
@@ -1300,7 +1307,6 @@ class LeakyClippedQuadratic(BaseDatafit):
         """Sparse path: O(nnz), optimized branches."""
         n = len(Xw)
         res = -self.Xty_prime[j]
-        epsilon = 1e-4
         if self.a <= -1e11:
             for i in range(X_indptr[j], X_indptr[j + 1]):
                 idx_i = X_indices[i]
@@ -1308,7 +1314,7 @@ class LeakyClippedQuadratic(BaseDatafit):
                 if zi <= self.b:
                     res += X_data[i] * zi
                 else:
-                    res += X_data[i] * (self.b + epsilon)
+                    res += X_data[i] * (self.b + self.alpha)
         else:
             for i in range(X_indptr[j], X_indptr[j + 1]):
                 idx_i = X_indices[i]
@@ -1318,12 +1324,12 @@ class LeakyClippedQuadratic(BaseDatafit):
                     if zi <= self.b:
                         res += X_data[i] * zi
                     else:
-                        res += X_data[i] * (self.b + epsilon)
+                        res += X_data[i] * (self.b + self.alpha)
                 elif mask == 2:
                     if zi >= self.a:
                         res += X_data[i] * zi
                     else:
-                        res += X_data[i] * (self.a - epsilon)
+                        res += X_data[i] * (self.a - self.alpha)
                 else:
                     res += X_data[i] * zi
         return res / n
@@ -1332,7 +1338,6 @@ class LeakyClippedQuadratic(BaseDatafit):
         n_features = len(X_indptr) - 1
         n = len(y)
         grad = np.zeros(n_features, dtype=Xw.dtype)
-        epsilon = 1e-4
         for j in range(n_features):
             res = -self.Xty_prime[j]
             for i in range(X_indptr[j], X_indptr[j + 1]):
@@ -1343,12 +1348,12 @@ class LeakyClippedQuadratic(BaseDatafit):
                     if zi <= self.b:
                         res += X_data[i] * zi
                     else:
-                        res += X_data[i] * (self.b + epsilon)
+                        res += X_data[i] * (self.b + self.alpha)
                 elif mask == 2:
                     if zi >= self.a:
                         res += X_data[i] * zi
                     else:
-                        res += X_data[i] * (self.a - epsilon)
+                        res += X_data[i] * (self.a - self.alpha)
                 else:
                     res += X_data[i] * zi
             grad[j] = res / n
@@ -1360,13 +1365,18 @@ class LeakyClippedQuadratic(BaseDatafit):
     def intercept_update_step(self, y, Xw):
         n = len(Xw)
         val = 0.
-        epsilon = 1e-4
         for i in self.idx_linear:
             val += Xw[i] - y[i]
         for i in self.idx_upper:
-            val += min(Xw[i], self.b) - self.b - epsilon
+            zi = Xw[i]
+            z_clamp = min(zi, self.b)
+            nudge = self.alpha if zi > self.b else 0.
+            val += z_clamp + nudge - self.b
         for i in self.idx_lower:
-            val += max(Xw[i], self.a) - self.a + epsilon
+            zi = Xw[i]
+            z_clamp = max(zi, self.a)
+            nudge = -self.alpha if zi < self.a else 0.
+            val += z_clamp + nudge - self.a
         return val / n
 
 
@@ -1424,7 +1434,6 @@ class CensoredQuadratic(BaseDatafit):
             ('b', float64),
             ('Xty_prime', float64[:]),
             ('saturation_mask', uint8[:]),
-            ('is_one_sided', bool_),
             ('idx_upper', int64[:]),
             ('idx_lower', int64[:]),
             ('idx_linear', int64[:]),
@@ -1455,16 +1464,10 @@ class CensoredQuadratic(BaseDatafit):
 
     def initialize(self, X, y):
         n_samples, n_features = X.shape
-        self.is_one_sided = (self.a <= -1e11)
         self.Xty_prime = np.zeros(n_features, dtype=X.dtype)
         self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
         y_clipped = np.zeros(n_samples, dtype=X.dtype)
-        
-        # Partition indices for branchless dense gradient
-        idx_upper = []
-        idx_lower = []
-        idx_linear = []
-
+        idx_upper, idx_lower, idx_linear = [], [], []
         for i in range(n_samples):
             if y[i] >= self.b:
                 self.saturation_mask[i] = 1
@@ -1475,29 +1478,21 @@ class CensoredQuadratic(BaseDatafit):
                 y_clipped[i] = self.a
                 idx_lower.append(i)
             else:
-                self.saturation_mask[i] = 0
                 y_clipped[i] = y[i]
                 idx_linear.append(i)
-        
         self.idx_upper = np.array(idx_upper, dtype=np.int64)
         self.idx_lower = np.array(idx_lower, dtype=np.int64)
         self.idx_linear = np.array(idx_linear, dtype=np.int64)
-                
         for j in range(n_features):
             self.Xty_prime[j] = X[:, j] @ y_clipped
 
     def initialize_sparse(self, X_data, X_indptr, X_indices, y):
         n_samples = len(y)
         n_features = len(X_indptr) - 1
-        self.is_one_sided = (self.a <= -1e11)
         self.Xty_prime = np.zeros(n_features, dtype=X_data.dtype)
         self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
         y_clipped = np.zeros(n_samples, dtype=X_data.dtype)
-        
-        idx_upper = []
-        idx_lower = []
-        idx_linear = []
-
+        idx_upper, idx_lower, idx_linear = [], [], []
         for i in range(n_samples):
             if y[i] >= self.b:
                 self.saturation_mask[i] = 1
@@ -1508,14 +1503,11 @@ class CensoredQuadratic(BaseDatafit):
                 y_clipped[i] = self.a
                 idx_lower.append(i)
             else:
-                self.saturation_mask[i] = 0
                 y_clipped[i] = y[i]
                 idx_linear.append(i)
-        
         self.idx_upper = np.array(idx_upper, dtype=np.int64)
         self.idx_lower = np.array(idx_lower, dtype=np.int64)
         self.idx_linear = np.array(idx_linear, dtype=np.int64)
-                
         for j in range(n_features):
             res = 0.
             for i in range(X_indptr[j], X_indptr[j+1]):
