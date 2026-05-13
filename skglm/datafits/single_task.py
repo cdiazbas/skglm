@@ -974,12 +974,16 @@ class ClippedQuadratic(BaseDatafit):
         return (
             ('a', float64),
             ('b', float64),
-            ('Xty_prime', float64[:]),
-            ('saturation_mask', uint8[:]),
         )
 
     def params_to_dict(self):
         return dict(a=self.a, b=self.b)
+
+    def initialize(self, X, y):
+        pass
+
+    def initialize_sparse(self, X_data, X_indptr, X_indices, y):
+        pass
 
     def get_lipschitz(self, X, y):
         n_features = X.shape[1]
@@ -1000,44 +1004,6 @@ class ClippedQuadratic(BaseDatafit):
                 nrm2 += X_data[idx] ** 2
             lipschitz[j] = nrm2 / len(y)
         return lipschitz
-
-    def initialize(self, X, y):
-        n_samples, n_features = X.shape
-        self.Xty_prime = np.zeros(n_features, dtype=X.dtype)
-        self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
-        # For ClippedQuadratic, mask identifies samples outside [a, b]
-        for i in range(n_samples):
-            if y[i] >= self.b:
-                self.saturation_mask[i] = 1 # Upper
-            elif y[i] <= self.a:
-                self.saturation_mask[i] = 2 # Lower
-            else:
-                self.saturation_mask[i] = 0 # Linear
-                
-        for j in range(n_features):
-            res = 0.
-            for i in range(n_samples):
-                res += X[i, j] * y[i]
-            self.Xty_prime[j] = res
-
-    def initialize_sparse(self, X_data, X_indptr, X_indices, y):
-        n_samples = len(y)
-        n_features = len(X_indptr) - 1
-        self.Xty_prime = np.zeros(n_features, dtype=X_data.dtype)
-        self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
-        for i in range(n_samples):
-            if y[i] >= self.b:
-                self.saturation_mask[i] = 1
-            elif y[i] <= self.a:
-                self.saturation_mask[i] = 2
-            else:
-                self.saturation_mask[i] = 0
-                
-        for j in range(n_features):
-            res = 0.
-            for i in range(X_indptr[j], X_indptr[j+1]):
-                res += X_data[i] * y[X_indices[i]]
-            self.Xty_prime[j] = res
 
     def value(self, y, w, Xw):
         clipped = np.clip(Xw, self.a, self.b)
@@ -1063,35 +1029,38 @@ class ClippedQuadratic(BaseDatafit):
         return hessian
 
     def gradient_scalar(self, X, y, w, Xw, j):
+        """Dense path: Branchless indicators."""
         n = len(Xw)
-        val = 0.
+        res = 0.
         for i in range(n):
             zi = Xw[i]
-            if self.a <= zi <= self.b:
-                val += X[i, j] * (zi - y[i])
-        return val / n
+            is_linear = (zi >= self.a) * (zi <= self.b)
+            res += X[i, j] * is_linear * (zi - y[i])
+        return res / n
 
     def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
-        # grad_j = (1/n) * X_j.T @ (clip(Xw, a, b) - y_prime)
-        # where y_prime[i] = clip(y[i], a, b) = Xty_prime precomputed.
-        # clip(Xw[i], a, b) - y_prime[i] = 0 for saturated samples (cancels),
-        # = Xw[i] - y[i] for linear samples. Zero branches.
+        """Sparse path: Branchless indicators."""
         n = len(Xw)
-        res = -self.Xty_prime[j]
+        res = 0.
         for i in range(X_indptr[j], X_indptr[j+1]):
             idx_i = X_indices[i]
-            res += X_data[i] * min(max(Xw[idx_i], self.a), self.b)
+            zi = Xw[idx_i]
+            is_linear = (zi >= self.a) * (zi <= self.b)
+            res += X_data[i] * is_linear * (zi - y[idx_i])
         return res / n
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
+        """Sparse path: Single-pass O(nnz), zero allocation."""
         n_features = len(X_indptr) - 1
         n = len(y)
         grad = np.zeros(n_features, dtype=Xw.dtype)
         for j in range(n_features):
-            res = -self.Xty_prime[j]
+            res = 0.
             for i in range(X_indptr[j], X_indptr[j+1]):
                 idx_i = X_indices[i]
-                res += X_data[i] * min(max(Xw[idx_i], self.a), self.b)
+                zi = Xw[idx_i]
+                is_linear = (zi >= self.a) * (zi <= self.b)
+                res += X_data[i] * is_linear * (zi - y[idx_i])
             grad[j] = res / n
         return grad
 
@@ -1156,12 +1125,16 @@ class LeakyClippedQuadratic(BaseDatafit):
             ('a', float64),
             ('b', float64),
             ('alpha', float64),
-            ('Xty_prime', float64[:]),
-            ('saturation_mask', uint8[:]),
         )
 
     def params_to_dict(self):
         return dict(a=self.a, b=self.b, alpha=self.alpha)
+
+    def initialize(self, X, y):
+        pass
+
+    def initialize_sparse(self, X_data, X_indptr, X_indices, y):
+        pass
 
     def get_lipschitz(self, X, y):
         n_features = X.shape[1]
@@ -1182,43 +1155,6 @@ class LeakyClippedQuadratic(BaseDatafit):
                 nrm2 += X_data[idx] ** 2
             lipschitz[j] = nrm2 / len(y)
         return lipschitz
-
-    def initialize(self, X, y):
-        n_samples, n_features = X.shape
-        self.Xty_prime = np.zeros(n_features, dtype=X.dtype)
-        self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
-        for i in range(n_samples):
-            if y[i] >= self.b:
-                self.saturation_mask[i] = 1
-            elif y[i] <= self.a:
-                self.saturation_mask[i] = 2
-            else:
-                self.saturation_mask[i] = 0
-                
-        for j in range(n_features):
-            res = 0.
-            for i in range(n_samples):
-                res += X[i, j] * y[i]
-            self.Xty_prime[j] = res
-
-    def initialize_sparse(self, X_data, X_indptr, X_indices, y):
-        n_samples = len(y)
-        n_features = len(X_indptr) - 1
-        self.Xty_prime = np.zeros(n_features, dtype=X_data.dtype)
-        self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
-        for i in range(n_samples):
-            if y[i] >= self.b:
-                self.saturation_mask[i] = 1
-            elif y[i] <= self.a:
-                self.saturation_mask[i] = 2
-            else:
-                self.saturation_mask[i] = 0
-                
-        for j in range(n_features):
-            res = 0.
-            for i in range(X_indptr[j], X_indptr[j+1]):
-                res += X_data[i] * y[X_indices[i]]
-            self.Xty_prime[j] = res
 
     def _leaky_clip(self, z):
         z_clamped = min(max(z, self.a), self.b)
@@ -1256,44 +1192,49 @@ class LeakyClippedQuadratic(BaseDatafit):
         return hessian
 
     def gradient_scalar(self, X, y, w, Xw, j):
+        """Dense path: Branchless indicators."""
         n = len(Xw)
-        val = 0.
+        res = 0.
         for i in range(n):
             zi = Xw[i]
-            ci = self._leaky_clip(zi)
-            residual = ci - y[i]
-            if zi < self.a or zi > self.b:
-                val += X[i, j] * self.alpha * residual
-            else:
-                val += X[i, j] * residual
-        return val / n
+            is_linear = (zi >= self.a) * (zi <= self.b)
+            # Gradient is (multiplier * (ci - yi))
+            z_clamped = min(max(zi, self.a), self.b)
+            ci = z_clamped + self.alpha * (zi - z_clamped)
+            multiplier = 1.0 + (self.alpha - 1.0) * (1.0 - is_linear)
+            res += X[i, j] * multiplier * (ci - y[i])
+        return res / n
 
     def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
+        """Sparse path: Branchless indicators."""
         n = len(Xw)
-        val = 0.
+        res = 0.
         for i in range(X_indptr[j], X_indptr[j+1]):
             idx_i = X_indices[i]
             zi = Xw[idx_i]
-            if zi < self.a:
-                val += X_data[i] * self.alpha * (self.a + self.alpha * (zi - self.a) - y[idx_i])
-            elif zi > self.b:
-                val += X_data[i] * self.alpha * (self.b + self.alpha * (zi - self.b) - y[idx_i])
-            else:
-                val += X_data[i] * (zi - y[idx_i])
-        return val / n
+            is_linear = (zi >= self.a) * (zi <= self.b)
+            z_clamped = min(max(zi, self.a), self.b)
+            ci = z_clamped + self.alpha * (zi - z_clamped)
+            multiplier = 1.0 + (self.alpha - 1.0) * (1.0 - is_linear)
+            res += X_data[i] * multiplier * (ci - y[idx_i])
+        return res / n
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
+        """Sparse path: Single-pass O(nnz), zero allocation."""
         n_features = len(X_indptr) - 1
         n = len(y)
         grad = np.zeros(n_features, dtype=Xw.dtype)
-        # Pass 1: Compute raw gradient in O(n)
-        g = self.raw_grad(y, Xw)
-        # Pass 2: Branchless dot product
         for j in range(n_features):
             res = 0.
             for i in range(X_indptr[j], X_indptr[j+1]):
-                res += X_data[i] * g[X_indices[i]]
-            grad[j] = res
+                idx_i = X_indices[i]
+                zi = Xw[idx_i]
+                is_linear = (zi >= self.a) * (zi <= self.b)
+                z_clamped = min(max(zi, self.a), self.b)
+                ci = z_clamped + self.alpha * (zi - z_clamped)
+                multiplier = 1.0 + (self.alpha - 1.0) * (1.0 - is_linear)
+                res += X_data[i] * multiplier * (ci - y[idx_i])
+            grad[j] = res / n
         return grad
 
     def gradient(self, X, y, Xw):
