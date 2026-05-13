@@ -1084,35 +1084,58 @@ class ClippedQuadratic(BaseDatafit):
 
 
 class LeakyClippedQuadratic(BaseDatafit):
-    """Quadratic datafit with leaky clipped (saturated) predictions.
+    """Censored regression datafit with leaky slope past the saturation boundary.
 
-    Like :class:`ClippedQuadratic`, but outside the clipping range ``[a, b]``
-    a small slope ``alpha`` is applied so that gradients never vanish:
+    Extends :class:`CensoredQuadratic` by adding a small gradient when the
+    linear predictor overshoots the saturation boundary.  Where
+    :class:`CensoredQuadratic` has zero gradient for
+    :math:`z_i > b` (upper-saturated) or :math:`z_i < a` (lower-saturated),
+    this datafit applies a slope ``alpha``, preventing dead zones:
 
     .. math::
 
-        \\text{clip}_{\\text{leaky}}(z, a, b, \\alpha) = \\begin{cases}
-            a + \\alpha(z - a) & z < a \\\\
-            z                  & a \\le z \\le b \\\\
-            b + \\alpha(z - b) & z > b
+        f_i(z_i) = \\begin{cases}
+            \\frac{1}{2}(z_i - y_i)^2
+                & a < y_i < b \\\\
+            \\frac{1}{2}\\max(0,\\, b - z_i)^2
+              + \\frac{\\alpha}{2}\\max(0,\\, z_i - b)^2
+                & y_i \\ge b \\\\
+            \\frac{1}{2}\\max(0,\\, z_i - a)^2
+              + \\frac{\\alpha}{2}\\max(0,\\, a - z_i)^2
+                & y_i \\le a
         \\end{cases}
+
+    The per-sample gradient equals :math:`z_i^{\\text{eff}} - y_i^{\\text{clip}}`
+    where :math:`y_i^{\\text{clip}} = \\text{clip}(y_i, a, b)` (precomputed) and:
+
+    .. math::
+
+        z_i^{\\text{eff}} = \\alpha z_i + (1-\\alpha)\\,\\text{clamp}_i(z_i)
+
+    with :math:`\\text{clamp}_i(z) = \\min(z, b)` for upper-saturated samples,
+    :math:`\\max(z, a)` for lower-saturated, and :math:`z` for linear ones.
+
+    This formulation correctly models censored data (like :class:`CensoredQuadratic`)
+    while guaranteeing non-zero gradients everywhere (unlike plain Censored where
+    the gradient vanishes once the predictor satisfies the censoring constraint).
 
     Parameters
     ----------
     a : float
-        Lower bound of the clipping range.
+        Lower saturation bound.
     b : float
-        Upper bound of the clipping range.
+        Upper saturation bound.
     alpha : float, default=0.1
-        Leakage slope applied outside ``[a, b]``. Must satisfy
-        ``0 < alpha < 1``.
+        Leakage slope applied when the predictor overshoots the boundary.
+        Must satisfy ``0 < alpha < 1``.
 
     Notes
     -----
-    The Lipschitz constant equals that of the plain :class:`Quadratic`
-    datafit: the second derivative is :math:`\\alpha^2 \\le 1` outside the
-    clipping range and 1 inside, so the standard OLS bound
+    The Lipschitz constant is identical to :class:`Quadratic`: the second
+    derivative is in :math:`\\{\\alpha, 1\\}` everywhere, so
     :math:`L_j = \\frac{1}{n}\\|X_{:,j}\\|^2` remains valid.
+
+    The class is jit compiled at fit time using Numba.
     """
 
     def __init__(self, a, b, alpha=0.1):
@@ -1125,16 +1148,15 @@ class LeakyClippedQuadratic(BaseDatafit):
             ('a', float64),
             ('b', float64),
             ('alpha', float64),
+            ('Xty_prime', float64[:]),
+            ('saturation_mask', uint8[:]),
+            ('idx_upper', int64[:]),
+            ('idx_lower', int64[:]),
+            ('idx_linear', int64[:]),
         )
 
     def params_to_dict(self):
         return dict(a=self.a, b=self.b, alpha=self.alpha)
-
-    def initialize(self, X, y):
-        pass
-
-    def initialize_sparse(self, X_data, X_indptr, X_indices, y):
-        pass
 
     def get_lipschitz(self, X, y):
         n_features = X.shape[1]
@@ -1156,84 +1178,179 @@ class LeakyClippedQuadratic(BaseDatafit):
             lipschitz[j] = nrm2 / len(y)
         return lipschitz
 
-    def _leaky_clip(self, z):
-        z_clamped = min(max(z, self.a), self.b)
-        return z_clamped + self.alpha * (z - z_clamped)
+    def initialize(self, X, y):
+        n_samples, n_features = X.shape
+        self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
+        y_clipped = np.empty(n_samples, dtype=X.dtype)
+        idx_upper, idx_lower, idx_linear = [], [], []
+        for i in range(n_samples):
+            if y[i] >= self.b:
+                self.saturation_mask[i] = 1
+                y_clipped[i] = self.b
+                idx_upper.append(i)
+            elif y[i] <= self.a:
+                self.saturation_mask[i] = 2
+                y_clipped[i] = self.a
+                idx_lower.append(i)
+            else:
+                self.saturation_mask[i] = 0
+                y_clipped[i] = y[i]
+                idx_linear.append(i)
+        self.idx_linear = np.array(idx_linear, dtype=np.int64)
+        self.idx_upper = np.array(idx_upper, dtype=np.int64)
+        self.idx_lower = np.array(idx_lower, dtype=np.int64)
+        self.Xty_prime = X.T @ y_clipped
+
+    def initialize_sparse(self, X_data, X_indptr, X_indices, y):
+        n_samples = len(y)
+        n_features = len(X_indptr) - 1
+        self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
+        y_clipped = np.empty(n_samples, dtype=X_data.dtype)
+        idx_upper, idx_lower, idx_linear = [], [], []
+        for i in range(n_samples):
+            if y[i] >= self.b:
+                self.saturation_mask[i] = 1
+                y_clipped[i] = self.b
+                idx_upper.append(i)
+            elif y[i] <= self.a:
+                self.saturation_mask[i] = 2
+                y_clipped[i] = self.a
+                idx_lower.append(i)
+            else:
+                self.saturation_mask[i] = 0
+                y_clipped[i] = y[i]
+                idx_linear.append(i)
+        self.idx_linear = np.array(idx_linear, dtype=np.int64)
+        self.idx_upper = np.array(idx_upper, dtype=np.int64)
+        self.idx_lower = np.array(idx_lower, dtype=np.int64)
+        self.Xty_prime = np.zeros(n_features, dtype=X_data.dtype)
+        for j in range(n_features):
+            res = 0.
+            for i in range(X_indptr[j], X_indptr[j + 1]):
+                res += X_data[i] * y_clipped[X_indices[i]]
+            self.Xty_prime[j] = res
 
     def value(self, y, w, Xw):
         n = len(y)
         total = 0.
         for i in range(n):
-            c = self._leaky_clip(Xw[i])
-            total += (y[i] - c) ** 2
-        return total / (2 * n)
+            zi = Xw[i]
+            mask = self.saturation_mask[i]
+            if mask == 1:
+                censored = min(zi, self.b) - self.b  # ≤ 0
+                leaky = max(zi - self.b, 0.)          # ≥ 0
+                total += 0.5 * censored * censored + 0.5 * self.alpha * leaky * leaky
+            elif mask == 2:
+                censored = max(zi, self.a) - self.a   # ≥ 0
+                leaky = max(self.a - zi, 0.)           # ≥ 0
+                total += 0.5 * censored * censored + 0.5 * self.alpha * leaky * leaky
+            else:
+                total += 0.5 * (zi - y[i]) ** 2
+        return total / n
 
     def raw_grad(self, y, Xw):
+        """Per-sample gradient: z_clamp + epsilon_nudge - y_clipped."""
         n = len(y)
         grad = np.zeros(n, dtype=Xw.dtype)
+        epsilon = 1e-4
         for i in range(n):
             zi = Xw[i]
-            z_clamped = min(max(zi, self.a), self.b)
-            ci = z_clamped + self.alpha * (zi - z_clamped)
-            multiplier = 1.0 if zi == z_clamped else self.alpha
-            grad[i] = multiplier * (ci - y[i]) / n
+            mask = self.saturation_mask[i]
+            if mask == 1:
+                z_clamp = min(zi, self.b)
+                nudge = epsilon if zi > self.b else 0.
+                grad[i] = (z_clamp + nudge - self.b) / n
+            elif mask == 2:
+                z_clamp = max(zi, self.a)
+                nudge = -epsilon if zi < self.a else 0.
+                grad[i] = (z_clamp + nudge - self.a) / n
+            else:
+                grad[i] = (zi - y[i]) / n
         return grad
 
     def raw_hessian(self, y, Xw):
-        """Compute Hessian of datafit w.r.t ``Xw``."""
         n = len(y)
         hessian = np.zeros(n, dtype=Xw.dtype)
         for i in range(n):
             zi = Xw[i]
             if self.a <= zi <= self.b:
-                hessian[i] = 1 / n
-            else:
-                hessian[i] = (self.alpha ** 2) / n
+                hessian[i] = 1.0 / n
         return hessian
 
     def gradient_scalar(self, X, y, w, Xw, j):
-        """Dense path: Branchless indicators."""
+        """Dense path: index-partitioned, Epsilon-nudge logic."""
         n = len(Xw)
-        res = 0.
-        for i in range(n):
+        res = -self.Xty_prime[j]
+        epsilon = 1e-4
+        for i in self.idx_linear:
+            res += X[i, j] * Xw[i]
+        for i in self.idx_upper:
             zi = Xw[i]
-            is_linear = (zi >= self.a) * (zi <= self.b)
-            # Gradient is (multiplier * (ci - yi))
-            z_clamped = min(max(zi, self.a), self.b)
-            ci = z_clamped + self.alpha * (zi - z_clamped)
-            multiplier = 1.0 + (self.alpha - 1.0) * (1.0 - is_linear)
-            res += X[i, j] * multiplier * (ci - y[i])
+            z_clamp = min(zi, self.b)
+            nudge = epsilon if zi > self.b else 0.
+            res += X[i, j] * (z_clamp + nudge)
+        for i in self.idx_lower:
+            zi = Xw[i]
+            z_clamp = max(zi, self.a)
+            nudge = -epsilon if zi < self.a else 0.
+            res += X[i, j] * (z_clamp + nudge)
         return res / n
 
     def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
-        """Sparse path: Branchless indicators."""
+        """Sparse path: O(nnz), optimized branches."""
         n = len(Xw)
-        res = 0.
-        for i in range(X_indptr[j], X_indptr[j+1]):
-            idx_i = X_indices[i]
-            zi = Xw[idx_i]
-            is_linear = (zi >= self.a) * (zi <= self.b)
-            z_clamped = min(max(zi, self.a), self.b)
-            ci = z_clamped + self.alpha * (zi - z_clamped)
-            multiplier = 1.0 + (self.alpha - 1.0) * (1.0 - is_linear)
-            res += X_data[i] * multiplier * (ci - y[idx_i])
+        res = -self.Xty_prime[j]
+        epsilon = 1e-4
+        if self.a <= -1e11:
+            for i in range(X_indptr[j], X_indptr[j + 1]):
+                idx_i = X_indices[i]
+                zi = Xw[idx_i]
+                if zi <= self.b:
+                    res += X_data[i] * zi
+                else:
+                    res += X_data[i] * (self.b + epsilon)
+        else:
+            for i in range(X_indptr[j], X_indptr[j + 1]):
+                idx_i = X_indices[i]
+                zi = Xw[idx_i]
+                mask = self.saturation_mask[idx_i]
+                if mask == 1:
+                    if zi <= self.b:
+                        res += X_data[i] * zi
+                    else:
+                        res += X_data[i] * (self.b + epsilon)
+                elif mask == 2:
+                    if zi >= self.a:
+                        res += X_data[i] * zi
+                    else:
+                        res += X_data[i] * (self.a - epsilon)
+                else:
+                    res += X_data[i] * zi
         return res / n
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
-        """Sparse path: Single-pass O(nnz), zero allocation."""
         n_features = len(X_indptr) - 1
         n = len(y)
         grad = np.zeros(n_features, dtype=Xw.dtype)
+        epsilon = 1e-4
         for j in range(n_features):
-            res = 0.
-            for i in range(X_indptr[j], X_indptr[j+1]):
+            res = -self.Xty_prime[j]
+            for i in range(X_indptr[j], X_indptr[j + 1]):
                 idx_i = X_indices[i]
                 zi = Xw[idx_i]
-                is_linear = (zi >= self.a) * (zi <= self.b)
-                z_clamped = min(max(zi, self.a), self.b)
-                ci = z_clamped + self.alpha * (zi - z_clamped)
-                multiplier = 1.0 + (self.alpha - 1.0) * (1.0 - is_linear)
-                res += X_data[i] * multiplier * (ci - y[idx_i])
+                mask = self.saturation_mask[idx_i]
+                if mask == 1:
+                    if zi <= self.b:
+                        res += X_data[i] * zi
+                    else:
+                        res += X_data[i] * (self.b + epsilon)
+                elif mask == 2:
+                    if zi >= self.a:
+                        res += X_data[i] * zi
+                    else:
+                        res += X_data[i] * (self.a - epsilon)
+                else:
+                    res += X_data[i] * zi
             grad[j] = res / n
         return grad
 
@@ -1243,12 +1360,13 @@ class LeakyClippedQuadratic(BaseDatafit):
     def intercept_update_step(self, y, Xw):
         n = len(Xw)
         val = 0.
-        for i in range(n):
-            zi = Xw[i]
-            z_clamped = min(max(zi, self.a), self.b)
-            ci = z_clamped + self.alpha * (zi - z_clamped)
-            multiplier = 1.0 if zi == z_clamped else self.alpha
-            val += multiplier * (ci - y[i])
+        epsilon = 1e-4
+        for i in self.idx_linear:
+            val += Xw[i] - y[i]
+        for i in self.idx_upper:
+            val += min(Xw[i], self.b) - self.b - epsilon
+        for i in self.idx_lower:
+            val += max(Xw[i], self.a) - self.a + epsilon
         return val / n
 
 
