@@ -742,23 +742,40 @@ class CachedQuadratic(Quadratic):
         return self.lipschitz
 
 
-class LassoFastLoop(BaseEstimator):
-    """Fast runner for multi-target regression with shared design matrix.
+class LassoFastLoop(RegressorMixin, BaseEstimator):
+    """Self-caching Lasso estimator: drop-in replacement for ``Lasso``.
 
-    All X-dependent overhead is paid once in ``__init__``. Subsequent
-    calls to ``fit(y)`` reuse precomputed Lipschitz constants and
-    warmed-up Numba kernels.
+    Behaves exactly like ``Lasso.fit(X, y)`` but caches all X-dependent
+    quantities (Lipschitz constants, Numba-compiled kernels) across calls.
+    When ``fit`` is called again with the same design matrix, the O(nnz)
+    Lipschitz pass and Python JIT-compilation overhead are skipped entirely.
 
-    Typical usage::
+    X identity is detected using object identity (``X is cache``) plus shape
+    and dtype metadata — O(1) checks with no element-wise comparison.  If X
+    changes, the cache is transparently rebuilt.
 
-        runner = LassoFastLoop(X, alpha=0.1)
-        coefs = np.column_stack([runner.fit(Y[:, k]) for k in range(K)])
+    .. warning::
+        Do **not** modify ``X`` in-place after calling ``fit``.  The cache
+        stores a reference, not a copy.  In-place mutations will corrupt the
+        Lipschitz constants without triggering a recompute.  Pass a new array
+        (or use ``force_recompute=True``) if the data has changed.
+
+    Typical usage — standard sklearn style::
+
+        model = LassoFastLoop(alpha=0.1)
+        for y_k in Y.T:
+            model.fit(X, y_k)   # first call builds cache; subsequent calls skip it
+            results.append(model.coef_.copy())
+
+    Pre-fitted runner style (pay X-cost explicitly once)::
+
+        model = LassoFastLoop(alpha=0.1)
+        model.fit(X, Y[:, 0])          # warms up cache
+        for y_k in Y[:, 1:].T:
+            model.fit(X, y_k)          # cache hit, minimal overhead
 
     Parameters
     ----------
-    X : array-like of shape (n_samples, n_features)
-        Design matrix. Converted to CSC float64 in ``__init__``.
-
     alpha : float, default=1.0
         L1 regularisation strength.
 
@@ -774,66 +791,115 @@ class LassoFastLoop(BaseEstimator):
     tol : float, default=1e-4
         Convergence tolerance.
 
+    positive : bool, default=False
+        Enforce non-negative coefficients.
+
+    fit_intercept : bool, default=True
+        Whether to fit an intercept.
+
     ws_strategy : str, default="subdiff"
         Working-set strategy (``'subdiff'`` or ``'fixpoint'``).
 
     Attributes
     ----------
     coef_ : ndarray of shape (n_features,)
-        Coefficients from the last ``fit(y)`` call.
+        Coefficients from the last ``fit`` call.
+
+    intercept_ : float
+        Intercept from the last ``fit`` call.
     """
 
-    def __init__(self, X, alpha=1.0, max_iter=50, max_epochs=50_000, p0=10,
-                 tol=1e-4, ws_strategy="subdiff"):
+    def __init__(self, alpha=1.0, max_iter=50, max_epochs=50_000, p0=10,
+                 tol=1e-4, positive=False, fit_intercept=True,
+                 ws_strategy="subdiff"):
         self.alpha = alpha
         self.max_iter = max_iter
         self.max_epochs = max_epochs
         self.p0 = p0
         self.tol = tol
+        self.positive = positive
+        self.fit_intercept = fit_intercept
         self.ws_strategy = ws_strategy
 
-        # Validate and store X once
+        # Cache state — populated on first fit, reused when X is the same
+        self.X_ = None
+        self._X_input_ref = None
+        self._datafit = None
+        self._penalty = None
+        self._solver = None
+
+    def _is_same_X(self, X):
+        """O(1) check: is X the same matrix as the cached one?"""
+        if self._X_input_ref is None:
+            return False
+        if X is self._X_input_ref:
+            return True
+        # Fallback for views or re-assigned variables pointing to same buffer:
+        if X.shape != self._X_input_ref.shape or X.dtype != self._X_input_ref.dtype:
+            return False
+        if issparse(X) and issparse(self._X_input_ref):
+            return X.data.ctypes.data == self._X_input_ref.data.ctypes.data
+        if not issparse(X) and not issparse(self._X_input_ref):
+            return X.ctypes.data == self._X_input_ref.ctypes.data
+        return False
+
+    def _warm_up(self, X):
+        """Build all X-dependent cache: validate, Lipschitz, compile."""
+        self._X_input_ref = X
         self.X_ = check_array(
             X, accept_sparse="csc", dtype=np.float64, order="F",
             copy=False, accept_large_sparse=False)
 
-        # 1. Pre-compute Lipschitz constants (X-only, no y needed)
-        datafit = Quadratic()
         y_dummy = np.zeros(self.X_.shape[0], dtype=np.float64)
+        datafit = Quadratic()
         if issparse(self.X_):
             lipschitz = datafit.get_lipschitz_sparse(
                 self.X_.data, self.X_.indptr, self.X_.indices, y_dummy)
         else:
             lipschitz = datafit.get_lipschitz(self.X_, y_dummy)
 
-        # 2. Compile custom CachedQuadratic and penalty
-        # This effectively "moves" the Lipschitz calculation to init
         self._datafit = compiled_clone(CachedQuadratic(lipschitz))
-        self._penalty = compiled_clone(L1(alpha))
-
+        self._penalty = compiled_clone(L1(self.alpha, self.positive))
         self._solver = AndersonCD(
-            max_iter=max_iter, max_epochs=max_epochs, p0=p0,
-            tol=tol, ws_strategy=ws_strategy, fit_intercept=False,
-            warm_start=False, verbose=0)
+            max_iter=self.max_iter, max_epochs=self.max_epochs, p0=self.p0,
+            tol=self.tol, ws_strategy=self.ws_strategy,
+            fit_intercept=self.fit_intercept, warm_start=False, verbose=0)
 
-    def fit(self, y):
-        """Fit to a single target vector, reusing all X-dependent precomputation.
+    def fit(self, X, y, force_recompute=False):
+        """Fit the model, using cached X-state when possible.
 
         Parameters
         ----------
+        X : array-like of shape (n_samples, n_features)
+            Design matrix.
+
         y : array-like of shape (n_samples,)
             Target values.
 
+        force_recompute : bool, default=False
+            Force rebuilding the X cache even if X appears unchanged.
+            Use this if you have modified X in-place.
+
         Returns
         -------
-        coef : ndarray of shape (n_features,)
-            Solution coefficients.
+        self : LassoFastLoop
+            Fitted estimator.
         """
+        if force_recompute or not self._is_same_X(X):
+            self._warm_up(X)
+
         y = np.ascontiguousarray(y, dtype=np.float64)
         w, _, _ = self._solver._solve(
             self.X_, y, self._datafit, self._penalty)
-        self.coef_ = w
-        return w
+
+        if self.fit_intercept:
+            self.coef_ = w[:-1]
+            self.intercept_ = w[-1]
+        else:
+            self.coef_ = w
+            self.intercept_ = 0.
+
+        return self
 
 
 
