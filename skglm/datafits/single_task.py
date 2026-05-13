@@ -1072,16 +1072,15 @@ class ClippedQuadratic(BaseDatafit):
         return val / n
 
     def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
+        # grad_j = (1/n) * X_j.T @ (clip(Xw, a, b) - y_prime)
+        # where y_prime[i] = clip(y[i], a, b) = Xty_prime precomputed.
+        # clip(Xw[i], a, b) - y_prime[i] = 0 for saturated samples (cancels),
+        # = Xw[i] - y[i] for linear samples. Zero branches.
         n = len(Xw)
-        # Grad = 1/n * sum_{zi in [a, b]} Xij * (zi - yi)
-        # = 1/n * (Xj.T @ (Xw - y) - Correction)
         res = -self.Xty_prime[j]
         for i in range(X_indptr[j], X_indptr[j+1]):
             idx_i = X_indices[i]
-            zi = Xw[idx_i]
-            res += X_data[i] * zi
-            if zi < self.a or zi > self.b:
-                res -= X_data[i] * (zi - y[idx_i])
+            res += X_data[i] * min(max(Xw[idx_i], self.a), self.b)
         return res / n
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
@@ -1092,10 +1091,7 @@ class ClippedQuadratic(BaseDatafit):
             res = -self.Xty_prime[j]
             for i in range(X_indptr[j], X_indptr[j+1]):
                 idx_i = X_indices[i]
-                zi = Xw[idx_i]
-                res += X_data[i] * zi
-                if zi < self.a or zi > self.b:
-                    res -= X_data[i] * (zi - y[idx_i])
+                res += X_data[i] * min(max(Xw[idx_i], self.a), self.b)
             grad[j] = res / n
         return grad
 
@@ -1225,11 +1221,8 @@ class LeakyClippedQuadratic(BaseDatafit):
             self.Xty_prime[j] = res
 
     def _leaky_clip(self, z):
-        if z < self.a:
-            return self.a + self.alpha * (z - self.a)
-        elif z > self.b:
-            return self.b + self.alpha * (z - self.b)
-        return z
+        z_clamped = min(max(z, self.a), self.b)
+        return z_clamped + self.alpha * (z - z_clamped)
 
     def value(self, y, w, Xw):
         n = len(y)
@@ -1240,17 +1233,14 @@ class LeakyClippedQuadratic(BaseDatafit):
         return total / (2 * n)
 
     def raw_grad(self, y, Xw):
-        """Compute per-sample gradient of the loss w.r.t. ``Xw``."""
         n = len(y)
         grad = np.zeros(n, dtype=Xw.dtype)
         for i in range(n):
             zi = Xw[i]
-            ci = self._leaky_clip(zi)
-            residual = ci - y[i]
-            if zi < self.a or zi > self.b:
-                grad[i] = self.alpha * residual / n
-            else:
-                grad[i] = residual / n
+            z_clamped = min(max(zi, self.a), self.b)
+            ci = z_clamped + self.alpha * (zi - z_clamped)
+            multiplier = 1.0 if zi == z_clamped else self.alpha
+            grad[i] = multiplier * (ci - y[i]) / n
         return grad
 
     def raw_hessian(self, y, Xw):
@@ -1296,18 +1286,14 @@ class LeakyClippedQuadratic(BaseDatafit):
         n_features = len(X_indptr) - 1
         n = len(y)
         grad = np.zeros(n_features, dtype=Xw.dtype)
+        # Pass 1: Compute raw gradient in O(n)
+        g = self.raw_grad(y, Xw)
+        # Pass 2: Branchless dot product
         for j in range(n_features):
             res = 0.
             for i in range(X_indptr[j], X_indptr[j+1]):
-                idx_i = X_indices[i]
-                zi = Xw[idx_i]
-                if zi < self.a:
-                    res += X_data[i] * self.alpha * (self.a + self.alpha * (zi - self.a) - y[idx_i])
-                elif zi > self.b:
-                    res += X_data[i] * self.alpha * (self.b + self.alpha * (zi - self.b) - y[idx_i])
-                else:
-                    res += X_data[i] * (zi - y[idx_i])
-            grad[j] = res / n
+                res += X_data[i] * g[X_indices[i]]
+            grad[j] = res
         return grad
 
     def gradient(self, X, y, Xw):
@@ -1316,22 +1302,12 @@ class LeakyClippedQuadratic(BaseDatafit):
     def intercept_update_step(self, y, Xw):
         n = len(Xw)
         val = 0.
-        if self.a <= -1e10:
-            for i in range(n):
-                zi = Xw[i]
-                if zi > self.b:
-                    val += self.alpha * (self.b + self.alpha * (zi - self.b) - y[i])
-                else:
-                    val += (zi - y[i])
-        else:
-            for i in range(n):
-                zi = Xw[i]
-                ci = self._leaky_clip(zi)
-                residual = ci - y[i]
-                if zi < self.a or zi > self.b:
-                    val += self.alpha * residual
-                else:
-                    val += residual
+        for i in range(n):
+            zi = Xw[i]
+            z_clamped = min(max(zi, self.a), self.b)
+            ci = z_clamped + self.alpha * (zi - z_clamped)
+            multiplier = 1.0 if zi == z_clamped else self.alpha
+            val += multiplier * (ci - y[i])
         return val / n
 
 
@@ -1390,6 +1366,9 @@ class CensoredQuadratic(BaseDatafit):
             ('Xty_prime', float64[:]),
             ('saturation_mask', uint8[:]),
             ('is_one_sided', bool_),
+            ('idx_upper', int64[:]),
+            ('idx_lower', int64[:]),
+            ('idx_linear', int64[:]),
         )
 
     def params_to_dict(self):
@@ -1422,16 +1401,28 @@ class CensoredQuadratic(BaseDatafit):
         self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
         y_clipped = np.zeros(n_samples, dtype=X.dtype)
         
+        # Partition indices for branchless dense gradient
+        idx_upper = []
+        idx_lower = []
+        idx_linear = []
+
         for i in range(n_samples):
             if y[i] >= self.b:
                 self.saturation_mask[i] = 1
                 y_clipped[i] = self.b
+                idx_upper.append(i)
             elif y[i] <= self.a:
                 self.saturation_mask[i] = 2
                 y_clipped[i] = self.a
+                idx_lower.append(i)
             else:
                 self.saturation_mask[i] = 0
                 y_clipped[i] = y[i]
+                idx_linear.append(i)
+        
+        self.idx_upper = np.array(idx_upper, dtype=np.int64)
+        self.idx_lower = np.array(idx_lower, dtype=np.int64)
+        self.idx_linear = np.array(idx_linear, dtype=np.int64)
                 
         for j in range(n_features):
             self.Xty_prime[j] = X[:, j] @ y_clipped
@@ -1444,16 +1435,27 @@ class CensoredQuadratic(BaseDatafit):
         self.saturation_mask = np.zeros(n_samples, dtype=np.uint8)
         y_clipped = np.zeros(n_samples, dtype=X_data.dtype)
         
+        idx_upper = []
+        idx_lower = []
+        idx_linear = []
+
         for i in range(n_samples):
             if y[i] >= self.b:
                 self.saturation_mask[i] = 1
                 y_clipped[i] = self.b
+                idx_upper.append(i)
             elif y[i] <= self.a:
                 self.saturation_mask[i] = 2
                 y_clipped[i] = self.a
+                idx_lower.append(i)
             else:
                 self.saturation_mask[i] = 0
                 y_clipped[i] = y[i]
+                idx_linear.append(i)
+        
+        self.idx_upper = np.array(idx_upper, dtype=np.int64)
+        self.idx_lower = np.array(idx_lower, dtype=np.int64)
+        self.idx_linear = np.array(idx_linear, dtype=np.int64)
                 
         for j in range(n_features):
             res = 0.
@@ -1466,35 +1468,28 @@ class CensoredQuadratic(BaseDatafit):
         total = 0.
         for i in range(n):
             zi = Xw[i]
-            yi = y[i]
-            if yi >= self.b:
-                diff = zi - self.b
-                if diff < 0.:
-                    total += 0.5 * diff * diff
-            elif yi <= self.a:
-                diff = zi - self.a
-                if diff > 0.:
-                    total += 0.5 * diff * diff
+            mask = self.saturation_mask[i]
+            if mask == 1:
+                diff = min(zi, self.b) - self.b
+            elif mask == 2:
+                diff = max(zi, self.a) - self.a
             else:
-                diff = zi - yi
-                total += 0.5 * diff * diff
+                diff = zi - y[i]
+            total += 0.5 * diff * diff
         return total / n
 
     def raw_grad(self, y, Xw):
-        """Compute per-sample gradient of the loss w.r.t. ``Xw``."""
         n = len(y)
         grad = np.zeros(n, dtype=Xw.dtype)
         for i in range(n):
             zi = Xw[i]
-            yi = y[i]
-            if yi >= self.b:
-                if zi < self.b:
-                    grad[i] = (zi - self.b) / n
-            elif yi <= self.a:
-                if zi > self.a:
-                    grad[i] = (zi - self.a) / n
+            mask = self.saturation_mask[i]
+            if mask == 1:
+                grad[i] = (min(zi, self.b) - self.b) / n
+            elif mask == 2:
+                grad[i] = (max(zi, self.a) - self.a) / n
             else:
-                grad[i] = (zi - yi) / n
+                grad[i] = (zi - y[i]) / n
         return grad
 
     def raw_hessian(self, y, Xw):
@@ -1515,20 +1510,16 @@ class CensoredQuadratic(BaseDatafit):
         return hessian
 
     def gradient_scalar(self, X, y, w, Xw, j):
+        """Dense path: Zero branches, highly vectorized."""
         n = len(Xw)
-        val = 0.
-        for i in range(n):
-            zi = Xw[i]
-            yi = y[i]
-            if yi >= self.b:
-                if zi < self.b:
-                    val += X[i, j] * (zi - self.b)
-            elif yi <= self.a:
-                if zi > self.a:
-                    val += X[i, j] * (zi - self.a)
-            else:
-                val += X[i, j] * (zi - yi)
-        return val / n
+        res = -self.Xty_prime[j]
+        for i in self.idx_linear:
+            res += X[i, j] * Xw[i]
+        for i in self.idx_upper:
+            res += X[i, j] * min(Xw[i], self.b)
+        for i in self.idx_lower:
+            res += X[i, j] * max(Xw[i], self.a)
+        return res / n
 
     def gradient_scalar_sparse(self, X_data, X_indptr, X_indices, y, Xw, j):
         n = len(Xw)
@@ -1536,33 +1527,30 @@ class CensoredQuadratic(BaseDatafit):
         for i in range(X_indptr[j], X_indptr[j+1]):
             idx_i = X_indices[i]
             zi = Xw[idx_i]
-            res += X_data[i] * zi
             mask = self.saturation_mask[idx_i]
-            if mask == 1: # Upper
-                if zi >= self.b:
-                    res -= X_data[i] * (zi - self.b)
-            elif not self.is_one_sided and mask == 2: # Lower
-                if zi <= self.a:
-                    res -= X_data[i] * (zi - self.a)
+            if mask == 1:
+                zi = min(zi, self.b)
+            elif mask == 2:
+                zi = max(zi, self.a)
+            res += X_data[i] * zi
         return res / n
 
     def full_grad_sparse(self, X_data, X_indptr, X_indices, y, Xw):
+        """Sparse path: strictly O(nnz), no allocations."""
         n_features = len(X_indptr) - 1
-        n = len(y)
+        n = len(Xw)
         grad = np.zeros(n_features, dtype=Xw.dtype)
         for j in range(n_features):
             res = -self.Xty_prime[j]
             for i in range(X_indptr[j], X_indptr[j+1]):
                 idx_i = X_indices[i]
                 zi = Xw[idx_i]
-                res += X_data[i] * zi
                 mask = self.saturation_mask[idx_i]
                 if mask == 1:
-                    if zi >= self.b:
-                        res -= X_data[i] * (zi - self.b)
-                elif not self.is_one_sided and mask == 2:
-                    if zi <= self.a:
-                        res -= X_data[i] * (zi - self.a)
+                    zi = min(zi, self.b)
+                elif mask == 2:
+                    zi = max(zi, self.a)
+                res += X_data[i] * zi
             grad[j] = res / n
         return grad
 
@@ -1572,25 +1560,10 @@ class CensoredQuadratic(BaseDatafit):
     def intercept_update_step(self, y, Xw):
         n = len(Xw)
         val = 0.
-        if self.a <= -1e10:
-            for i in range(n):
-                yi = y[i]
-                if yi >= self.b:
-                    zi = Xw[i]
-                    if zi < self.b:
-                        val += (zi - self.b)
-                else:
-                    val += (Xw[i] - yi)
-        else:
-            for i in range(n):
-                zi = Xw[i]
-                yi = y[i]
-                if yi >= self.b:
-                    if zi < self.b:
-                        val += (zi - self.b)
-                elif yi <= self.a:
-                    if zi > self.a:
-                        val += (zi - self.a)
-                else:
-                    val += (zi - yi)
+        for i in self.idx_linear:
+            val += Xw[i] - y[i]
+        for i in self.idx_upper:
+            val += min(Xw[i], self.b) - self.b
+        for i in self.idx_lower:
+            val += max(Xw[i], self.a) - self.a
         return val / n
