@@ -25,6 +25,7 @@ from skglm.datafits import (
 from skglm.penalties import (L1, WeightedL1, L1_plus_L2, L2, WeightedGroupL2,
                              MCPenalty, WeightedMCPenalty, IndicatorBox, L2_1)
 from skglm.utils.data import grp_converter
+from skglm.utils.jit_compilation import compiled_clone
 from sklearn.utils.validation import validate_data
 
 
@@ -718,6 +719,123 @@ class CensoredLasso(RegressorMixin, LinearModel):
         tags = super().__sklearn_tags__()
         tags.input_tags.sparse = True
         return tags
+
+
+class CachedQuadratic(Quadratic):
+    """Quadratic datafit with cached Lipschitz constants."""
+
+    def __init__(self, lipschitz):
+        self.lipschitz = lipschitz
+
+    def get_spec(self):
+        from numba import float64
+        spec = super().get_spec() + (('lipschitz', float64[:]),)
+        return spec
+
+    def params_to_dict(self):
+        return dict(lipschitz=self.lipschitz)
+
+    def get_lipschitz(self, X, y):
+        return self.lipschitz
+
+    def get_lipschitz_sparse(self, X_data, X_indptr, X_indices, y):
+        return self.lipschitz
+
+
+class LassoFastLoop(BaseEstimator):
+    """Fast runner for multi-target regression with shared design matrix.
+
+    All X-dependent overhead is paid once in ``__init__``. Subsequent
+    calls to ``fit(y)`` reuse precomputed Lipschitz constants and
+    warmed-up Numba kernels.
+
+    Typical usage::
+
+        runner = LassoFastLoop(X, alpha=0.1)
+        coefs = np.column_stack([runner.fit(Y[:, k]) for k in range(K)])
+
+    Parameters
+    ----------
+    X : array-like of shape (n_samples, n_features)
+        Design matrix. Converted to CSC float64 in ``__init__``.
+
+    alpha : float, default=1.0
+        L1 regularisation strength.
+
+    max_iter : int, default=50
+        Maximum number of working-set iterations.
+
+    max_epochs : int, default=50000
+        Maximum number of CD epochs per working-set subproblem.
+
+    p0 : int, default=10
+        Initial working-set size.
+
+    tol : float, default=1e-4
+        Convergence tolerance.
+
+    ws_strategy : str, default="subdiff"
+        Working-set strategy (``'subdiff'`` or ``'fixpoint'``).
+
+    Attributes
+    ----------
+    coef_ : ndarray of shape (n_features,)
+        Coefficients from the last ``fit(y)`` call.
+    """
+
+    def __init__(self, X, alpha=1.0, max_iter=50, max_epochs=50_000, p0=10,
+                 tol=1e-4, ws_strategy="subdiff"):
+        self.alpha = alpha
+        self.max_iter = max_iter
+        self.max_epochs = max_epochs
+        self.p0 = p0
+        self.tol = tol
+        self.ws_strategy = ws_strategy
+
+        # Validate and store X once
+        self.X_ = check_array(
+            X, accept_sparse="csc", dtype=np.float64, order="F",
+            copy=False, accept_large_sparse=False)
+
+        # 1. Pre-compute Lipschitz constants (X-only, no y needed)
+        datafit = Quadratic()
+        y_dummy = np.zeros(self.X_.shape[0], dtype=np.float64)
+        if issparse(self.X_):
+            lipschitz = datafit.get_lipschitz_sparse(
+                self.X_.data, self.X_.indptr, self.X_.indices, y_dummy)
+        else:
+            lipschitz = datafit.get_lipschitz(self.X_, y_dummy)
+
+        # 2. Compile custom CachedQuadratic and penalty
+        # This effectively "moves" the Lipschitz calculation to init
+        self._datafit = compiled_clone(CachedQuadratic(lipschitz))
+        self._penalty = compiled_clone(L1(alpha))
+
+        self._solver = AndersonCD(
+            max_iter=max_iter, max_epochs=max_epochs, p0=p0,
+            tol=tol, ws_strategy=ws_strategy, fit_intercept=False,
+            warm_start=False, verbose=0)
+
+    def fit(self, y):
+        """Fit to a single target vector, reusing all X-dependent precomputation.
+
+        Parameters
+        ----------
+        y : array-like of shape (n_samples,)
+            Target values.
+
+        Returns
+        -------
+        coef : ndarray of shape (n_features,)
+            Solution coefficients.
+        """
+        y = np.ascontiguousarray(y, dtype=np.float64)
+        w, _, _ = self._solver._solve(
+            self.X_, y, self._datafit, self._penalty)
+        self.coef_ = w
+        return w
+
+
 
 
 class WeightedLasso(RegressorMixin, LinearModel):
