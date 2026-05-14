@@ -744,6 +744,15 @@ class CachedQuadratic(Quadratic):
     def __init__(self, lipschitz):
         self.lipschitz = lipschitz
 
+    def get_lipschitz(self, X, y):
+        return self.lipschitz
+
+    def get_lipschitz_sparse(self, X_data, X_indptr, X_indices, y):
+        return self.lipschitz
+
+    def params_to_dict(self):
+        return dict(lipschitz=self.lipschitz)
+
     def get_spec(self):
         import numba
         # Use numba.typeof to derive the exact array type (float32 or float64)
