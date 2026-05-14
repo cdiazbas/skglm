@@ -843,18 +843,24 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
 
     def _is_same_X(self, X):
         """O(1) check: is X the same matrix as the cached one?"""
-        if self._X_input_ref is None:
+        if self.X_ is None:
             return False
-        if X is self._X_input_ref:
+        # Fast path: exact same Python object as original input or internal copy
+        if X is self._X_input_ref or X is self.X_:
             return True
-        # Fallback for views or re-assigned variables pointing to same buffer:
-        if X.shape != self._X_input_ref.shape or X.dtype != self._X_input_ref.dtype:
+        # Shape/dtype guard before any pointer work
+        if X.shape != self.X_.shape or X.dtype != self.X_.dtype:
             return False
-        if issparse(X) and issparse(self._X_input_ref):
-            return X.data.ctypes.data == self._X_input_ref.data.ctypes.data
-        if not issparse(X) and not issparse(self._X_input_ref):
-            return X.ctypes.data == self._X_input_ref.ctypes.data
-        return False
+        # Sparse: compare data buffer pointers
+        if issparse(X) and issparse(self.X_):
+            return X.data.ctypes.data == self.X_.data.ctypes.data
+        if issparse(X) or issparse(self.X_):
+            return False
+        # Dense: check against both the original input pointer and the internal copy
+        x_ptr = X.ctypes.data
+        return (x_ptr == self.X_.ctypes.data or
+                x_ptr == (self._X_input_ref.ctypes.data
+                          if self._X_input_ref is not None else -1))
 
     def _warm_up(self, X):
         """Build all X-dependent cache: validate, Lipschitz, compile."""
@@ -890,6 +896,18 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
         t_warmup = 0.0
         if force_recompute or not is_same:
             t0 = time.perf_counter()
+            if self.verbose_debug and self.X_ is not None:
+                import sys
+                x_ptr = X.data.ctypes.data if issparse(X) else X.ctypes.data
+                cached_ptr = (self.X_.data.ctypes.data if issparse(self.X_)
+                              else self.X_.ctypes.data)
+                sys.stderr.write(
+                    f"[FastLoop DEBUG] Cache MISS reason: "
+                    f"id_match={X is self._X_input_ref or X is self.X_} "
+                    f"shape={X.shape == self.X_.shape} "
+                    f"dtype={X.dtype == self.X_.dtype} "
+                    f"ptr_input={x_ptr} cached={cached_ptr} "
+                    f"match={x_ptr == cached_ptr}\n")
             self._warm_up(X)
             t_warmup = time.perf_counter() - t0
 
