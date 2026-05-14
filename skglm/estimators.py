@@ -934,7 +934,8 @@ class LassoFastLoop(RegressorMixin, LinearModel):
 
         # Initialize w and Xw with the exact dtype of X to avoid Numba precision errors
         n_samples, n_features = self.X_.shape
-        w = np.zeros(n_features + 1, dtype=self.X_.dtype)
+        n_w = n_features + 1 if self.fit_intercept else n_features
+        w = np.zeros(n_w, dtype=self.X_.dtype)
         Xw = np.zeros(n_samples, dtype=self.X_.dtype)
 
         t0 = time.perf_counter()
