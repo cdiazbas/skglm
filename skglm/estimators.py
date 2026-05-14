@@ -734,14 +734,23 @@ class CensoredLasso(RegressorMixin, LinearModel):
 
 
 class CachedQuadratic(Quadratic):
-    """Quadratic datafit with cached Lipschitz constants."""
+    """Quadratic datafit with pre-computed, cached Lipschitz constants.
+
+    This class extends the standard Quadratic datafit by storing a
+    pre-computed Lipschitz array, so the solver can skip the O(np)
+    recomputation on every fit call.
+    """
 
     def __init__(self, lipschitz):
         self.lipschitz = lipschitz
 
     def get_spec(self):
-        from numba import float64
-        spec = super().get_spec() + (('lipschitz', float64[:]),)
+        import numba
+        # Use numba.typeof to derive the exact array type (float32 or float64)
+        # from the actual lipschitz array instance.
+        spec = super().get_spec() + (
+            ('lipschitz', numba.typeof(self.lipschitz)),
+        )
         return spec
 
     def params_to_dict(self):
@@ -754,37 +763,25 @@ class CachedQuadratic(Quadratic):
         return self.lipschitz
 
 
-class LassoFastLoop(RegressorMixin, BaseEstimator):
-    """Self-caching Lasso estimator: drop-in replacement for ``Lasso``.
+# Two explicit subclasses give Numba two distinct class identities.
+# This prevents JIT cache collisions when switching between float32/float64
+# in the same Python session (which would otherwise cause a deadlock).
+class CachedQuadratic32(CachedQuadratic):
+    """float32-specialized cached quadratic datafit."""
+    pass
 
-    Behaves exactly like ``Lasso.fit(X, y)`` but caches all X-dependent
-    quantities (Lipschitz constants, Numba-compiled kernels) across calls.
-    When ``fit`` is called again with the same design matrix, the O(nnz)
-    Lipschitz pass and Python JIT-compilation overhead are skipped entirely.
 
-    X identity is detected using object identity (``X is cache``) plus shape
-    and dtype metadata — O(1) checks with no element-wise comparison.  If X
-    changes, the cache is transparently rebuilt.
+class CachedQuadratic64(CachedQuadratic):
+    """float64-specialized cached quadratic datafit."""
+    pass
 
-    .. warning::
-        Do **not** modify ``X`` in-place after calling ``fit``.  The cache
-        stores a reference, not a copy.  In-place mutations will corrupt the
-        Lipschitz constants without triggering a recompute.  Pass a new array
-        (or use ``force_recompute=True``) if the data has changed.
 
-    Typical usage — standard sklearn style::
+class LassoFastLoop(RegressorMixin, LinearModel):
+    """Zero-overhead Lasso for high-throughput multi-target regression.
 
-        model = LassoFastLoop(alpha=0.1)
-        for y_k in Y.T:
-            model.fit(X, y_k)   # first call builds cache; subsequent calls skip it
-            results.append(model.coef_.copy())
-
-    Pre-fitted runner style (pay X-cost explicitly once)::
-
-        model = LassoFastLoop(alpha=0.1)
-        model.fit(X, Y[:, 0])          # warms up cache
-        for y_k in Y[:, 1:].T:
-            model.fit(X, y_k)          # cache hit, minimal overhead
+    Caches the design matrix, Lipschitz constants, and compiled solver
+    kernels across calls to ``fit``. When ``fit`` is called again with the
+    same design matrix, all O(np) overhead is skipped entirely.
 
     Parameters
     ----------
@@ -794,7 +791,7 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
     max_iter : int, default=50
         Maximum number of working-set iterations.
 
-    max_epochs : int, default=50000
+    max_epochs : int, default=50_000
         Maximum number of CD epochs per working-set subproblem.
 
     p0 : int, default=10
@@ -809,8 +806,14 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
     fit_intercept : bool, default=True
         Whether to fit an intercept.
 
+    warm_start : bool, default=False
+        Reuse the previous solution as the starting point for the next fit.
+
     ws_strategy : str, default="subdiff"
-        Working-set strategy (``'subdiff'`` or ``'fixpoint'``).
+        Working-set strategy: ``'subdiff'`` or ``'fixpoint'``.
+
+    verbose_debug : bool, default=False
+        Print per-call timing (Check / Warmup / Solve) to stderr.
 
     Attributes
     ----------
@@ -823,7 +826,7 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
 
     def __init__(self, alpha=1.0, max_iter=50, max_epochs=50_000, p0=10,
                  tol=1e-4, positive=False, fit_intercept=True,
-                 ws_strategy="subdiff", verbose_debug=False):
+                 warm_start=False, ws_strategy="subdiff", verbose_debug=False):
         self.alpha = alpha
         self.max_iter = max_iter
         self.max_epochs = max_epochs
@@ -831,6 +834,7 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
         self.tol = tol
         self.positive = positive
         self.fit_intercept = fit_intercept
+        self.warm_start = warm_start
         self.ws_strategy = ws_strategy
         self.verbose_debug = verbose_debug
 
@@ -842,34 +846,27 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
         self._solver = None
 
     def _is_same_X(self, X):
-        """O(1) check: is X the same matrix as the cached one?"""
-        if self.X_ is None:
+        """O(1) identity check against the cached design matrix."""
+        if self._X_input_ref is None:
             return False
-        # Fast path: exact same Python object as original input or internal copy
-        if X is self._X_input_ref or X is self.X_:
+        if X is self._X_input_ref:
             return True
-        # Shape/dtype guard before any pointer work
-        if X.shape != self.X_.shape or X.dtype != self.X_.dtype:
+        if X.shape != self._X_input_ref.shape or X.dtype != self._X_input_ref.dtype:
             return False
-        # Sparse: compare data buffer pointers
-        if issparse(X) and issparse(self.X_):
-            return X.data.ctypes.data == self.X_.data.ctypes.data
-        if issparse(X) or issparse(self.X_):
-            return False
-        # Dense: check against both the original input pointer and the internal copy
-        x_ptr = X.ctypes.data
-        return (x_ptr == self.X_.ctypes.data or
-                x_ptr == (self._X_input_ref.ctypes.data
-                          if self._X_input_ref is not None else -1))
+        if issparse(X) and issparse(self._X_input_ref):
+            return X.data.ctypes.data == self._X_input_ref.data.ctypes.data
+        if not issparse(X) and not issparse(self._X_input_ref):
+            return X.ctypes.data == self._X_input_ref.ctypes.data
+        return False
 
     def _warm_up(self, X):
-        """Build all X-dependent cache: validate, Lipschitz, compile."""
+        """Build all X-dependent cache: validate, Lipschitz, JIT-compile."""
         self._X_input_ref = X
         self.X_ = check_array(
-            X, accept_sparse="csc", dtype=np.float64, order="F",
+            X, accept_sparse="csc", dtype=[np.float64, np.float32], order="F",
             copy=False, accept_large_sparse=False)
 
-        y_dummy = np.zeros(self.X_.shape[0], dtype=np.float64)
+        y_dummy = np.zeros(self.X_.shape[0], dtype=self.X_.dtype)
         datafit = Quadratic()
         if issparse(self.X_):
             lipschitz = datafit.get_lipschitz_sparse(
@@ -877,44 +874,71 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
         else:
             lipschitz = datafit.get_lipschitz(self.X_, y_dummy)
 
-        self._datafit = compiled_clone(CachedQuadratic(lipschitz))
-        self._penalty = compiled_clone(L1(self.alpha, self.positive))
+        # Pick the explicit precision subclass so Numba always gets a unique
+        # class identity and never collides between float32 and float64.
+        to_float32 = self.X_.dtype == np.float32
+        Klass = CachedQuadratic32 if to_float32 else CachedQuadratic64
+
+        self._datafit = compiled_clone(Klass(lipschitz), to_float32=to_float32)
+        self._penalty = compiled_clone(L1(self.alpha, self.positive), to_float32=to_float32)
         self._solver = AndersonCD(
             max_iter=self.max_iter, max_epochs=self.max_epochs, p0=self.p0,
             tol=self.tol, ws_strategy=self.ws_strategy,
-            fit_intercept=self.fit_intercept, warm_start=False, verbose=0)
+            fit_intercept=self.fit_intercept, warm_start=self.warm_start,
+            verbose=0)
 
-    def fit(self, X, y, force_recompute=False):
-        """Fit the model, using cached X-state when possible."""
+    def fit(self, X, y, assume_same_X=True):
+        """Fit the model, reusing cached X-state when possible.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Design matrix.
+
+        y : array-like of shape (n_samples,)
+            Target values.
+
+        assume_same_X : {True, False, None}, default=True
+            Cache control:
+
+            - ``True``  — always reuse cached state (fastest; safe when X is
+              mathematically identical across calls even if it's a new object).
+            - ``False`` — always rebuild the cache.
+            - ``None``  — auto-detect via O(1) memory-address check.
+
+        Returns
+        -------
+        self : LassoFastLoop
+        """
         import time
         t_start = time.perf_counter()
 
         t0 = time.perf_counter()
-        is_same = self._is_same_X(X)
+        if assume_same_X is True and self.X_ is not None:
+            is_same = True
+        elif assume_same_X is False:
+            is_same = False
+        else:
+            is_same = self._is_same_X(X)
         t_check = time.perf_counter() - t0
 
         t_warmup = 0.0
-        if force_recompute or not is_same:
+        if not is_same:
             t0 = time.perf_counter()
-            if self.verbose_debug and self.X_ is not None:
-                import sys
-                x_ptr = X.data.ctypes.data if issparse(X) else X.ctypes.data
-                cached_ptr = (self.X_.data.ctypes.data if issparse(self.X_)
-                              else self.X_.ctypes.data)
-                sys.stderr.write(
-                    f"[FastLoop DEBUG] Cache MISS reason: "
-                    f"id_match={X is self._X_input_ref or X is self.X_} "
-                    f"shape={X.shape == self.X_.shape} "
-                    f"dtype={X.dtype == self.X_.dtype} "
-                    f"ptr_input={x_ptr} cached={cached_ptr} "
-                    f"match={x_ptr == cached_ptr}\n")
             self._warm_up(X)
             t_warmup = time.perf_counter() - t0
 
-        y = np.ascontiguousarray(y, dtype=np.float64)
+        y = np.asanyarray(y, dtype=self.X_.dtype)
+        if not y.flags.c_contiguous:
+            y = np.ascontiguousarray(y)
+
+        # Initialize w and Xw with the exact dtype of X to avoid Numba precision errors
+        n_samples, n_features = self.X_.shape
+        w = np.zeros(n_features + 1, dtype=self.X_.dtype)
+        Xw = np.zeros(n_samples, dtype=self.X_.dtype)
+
         t0 = time.perf_counter()
-        w, _, _ = self._solver._solve(
-            self.X_, y, self._datafit, self._penalty)
+        w, _, _ = self._solver._solve(self.X_, y, self._datafit, self._penalty, w, Xw)
         t_solve = time.perf_counter() - t0
 
         if self.fit_intercept:
@@ -924,15 +948,28 @@ class LassoFastLoop(RegressorMixin, BaseEstimator):
             self.coef_ = w
             self.intercept_ = 0.
 
-        t_total = time.perf_counter() - t_start
         if self.verbose_debug:
-            cache_status = "MISS" if force_recompute or not is_same else "HIT "
+            t_total = time.perf_counter() - t_start
+            if assume_same_X is True and is_same:
+                cache_status = "HIT (forced)"
+            elif assume_same_X is False:
+                cache_status = "MISS (forced)"
+            else:
+                cache_status = "HIT (auto)" if is_same else "MISS (auto)"
+            
+            format_str = "sparse" if issparse(self.X_) else "dense"
+            shape_str = f"{self.X_.shape[0]}x{self.X_.shape[1]}"
+            dtype_str = self.X_.dtype.name
+            
             import sys
-            sys.stderr.write(f"[FastLoop DEBUG] Cache: {cache_status} | "
-                             f"Check: {t_check*1000:.2f}ms | Warmup: {t_warmup:.3f}s | "
-                             f"Solve: {t_solve:.3f}s | Total: {t_total:.3f}s\n")
+            sys.stderr.write(
+                f"[FastLoop] {dtype_str} {format_str} {shape_str} | tol={self.tol:.0e} | "
+                f"Cache: {cache_status} | "
+                f"Check: {t_check*1000:.2f}ms | Warmup: {t_warmup:.3f}s | "
+                f"Solve: {t_solve:.3f}s | Total: {t_total:.3f}s\n")
 
         return self
+
 
 
 
