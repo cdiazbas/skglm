@@ -461,6 +461,134 @@ class Lasso(RegressorMixin, LinearModel):
         return tags
 
 
+class MultiLasso(RegressorMixin, BaseEstimator):
+    r"""Lasso for many targets solved simultaneously via block coordinate descent.
+
+    Fits K independent L1-penalised regressions sharing the same design matrix
+    ``X`` in a single solver call.  Each column ``X[:, j]`` is loaded from RAM
+    **once** per CD epoch regardless of the number of targets, and the
+    per-target gradient / proximal / residual-update steps are parallelised
+    over K with Numba ``prange``.
+
+    This is fundamentally faster than fitting K separate :class:`Lasso` models
+    (serially or in parallel threads) when ``n_targets`` is large, because it
+    eliminates redundant memory traffic for the design matrix.
+
+    The objective solved for each target k is:
+
+    .. math::
+        \min_{w_k} \frac{1}{2 n} \|y_k - X w_k\|_2^2 + \alpha \|w_k\|_1
+
+    All K problems are solved jointly but independently (no coupling term).
+
+    Parameters
+    ----------
+    alpha : float, default=1.0
+        L1 penalty strength (same for every target).
+
+    max_iter : int, default=50
+        Maximum number of working-set outer iterations.
+
+    max_epochs : int, default=50_000
+        Maximum number of CD epochs per working-set subproblem.
+
+    p0 : int, default=10
+        Initial working-set size.
+
+    tol : float, default=1e-4
+        Convergence tolerance (normalised subdifferential distance).
+
+    verbose : int, default=0
+        Verbosity level (0 = silent, 1 = outer iters, 2 = inner epochs).
+
+    ws_strategy : str, default="subdiff"
+        Working-set selection strategy: ``"subdiff"`` or ``"fixpoint"``.
+
+    Attributes
+    ----------
+    coef_ : ndarray of shape (n_targets, n_features)
+        Coefficient matrix — one row per target (sklearn multi-output
+        convention).
+
+    intercept_ : ndarray of shape (n_targets,)
+        All-zeros placeholder (intercept not supported in block-CD path).
+
+    n_iter_ : int
+        Number of outer working-set iterations performed.
+
+    See Also
+    --------
+    Lasso : Single-target Lasso.
+    MultiTaskLasso : Multi-task Lasso with L21 group penalty (coupled targets).
+    """
+
+    def __init__(self, alpha=1.0, max_iter=50, max_epochs=50_000, p0=10,
+                 tol=1e-4, verbose=0, ws_strategy="subdiff"):
+        self.alpha = alpha
+        self.max_iter = max_iter
+        self.max_epochs = max_epochs
+        self.p0 = p0
+        self.tol = tol
+        self.verbose = verbose
+        self.ws_strategy = ws_strategy
+
+    def fit(self, X, Y):
+        """Fit independent Lasso models for all targets simultaneously.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Design matrix.
+
+        Y : array-like of shape (n_samples, n_targets)
+            Target matrix.  Each column is one independent regression target.
+
+        Returns
+        -------
+        self
+        """
+        X = check_array(
+            X, dtype=[np.float32, np.float64], order="F", copy=False,
+            accept_sparse=False, accept_large_sparse=False)
+        Y = np.asarray(Y, dtype=X.dtype)
+        if Y.ndim == 1:
+            Y = Y[:, np.newaxis]
+        check_consistent_length(X, Y)
+
+        self.n_features_in_ = X.shape[1]
+
+        # Y_Kn : (K, n) C-contiguous — each row is one target, contiguous in n
+        Y_Kn = np.ascontiguousarray(Y.T)
+
+        solver = AndersonCD(
+            max_iter=self.max_iter, max_epochs=self.max_epochs, p0=self.p0,
+            tol=self.tol, ws_strategy=self.ws_strategy,
+            fit_intercept=False, warm_start=False, verbose=self.verbose)
+
+        W, obj_out, _ = solver._solve_multi(X, Y_Kn, float(self.alpha))
+
+        # W is (n_features, K) → coef_ is (K, n_features) sklearn convention
+        self.coef_ = np.ascontiguousarray(W.T)
+        self.intercept_ = np.zeros(Y_Kn.shape[0], dtype=X.dtype)
+        self.n_iter_ = len(obj_out)
+        return self
+
+    def predict(self, X):
+        """Predict for all targets.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        Y_pred : ndarray of shape (n_samples, n_targets)
+        """
+        check_is_fitted(self)
+        X = check_array(X, dtype=[np.float32, np.float64], copy=False)
+        return X @ self.coef_.T
+
+
 class ClippedLasso(RegressorMixin, LinearModel):
     r"""Lasso estimator with strictly clipped predictions.
 
@@ -731,255 +859,6 @@ class CensoredLasso(RegressorMixin, LinearModel):
         tags = super().__sklearn_tags__()
         tags.input_tags.sparse = True
         return tags
-
-
-class CachedQuadratic(Quadratic):
-    """Quadratic datafit with pre-computed, cached Lipschitz constants.
-
-    This class extends the standard Quadratic datafit by storing a
-    pre-computed Lipschitz array, so the solver can skip the O(np)
-    recomputation on every fit call.
-    """
-
-    def __init__(self, lipschitz):
-        self.lipschitz = lipschitz
-
-    def get_lipschitz(self, X, y):
-        return self.lipschitz
-
-    def get_lipschitz_sparse(self, X_data, X_indptr, X_indices, y):
-        return self.lipschitz
-
-    def params_to_dict(self):
-        return dict(lipschitz=self.lipschitz)
-
-    def get_spec(self):
-        import numba
-        # Use numba.typeof to derive the exact array type (float32 or float64)
-        # from the actual lipschitz array instance.
-        spec = super().get_spec() + (
-            ('lipschitz', numba.typeof(self.lipschitz)),
-        )
-        return spec
-
-    def params_to_dict(self):
-        return dict(lipschitz=self.lipschitz)
-
-    def get_lipschitz(self, X, y):
-        return self.lipschitz
-
-    def get_lipschitz_sparse(self, X_data, X_indptr, X_indices, y):
-        return self.lipschitz
-
-
-# Two explicit subclasses give Numba two distinct class identities.
-# This prevents JIT cache collisions when switching between float32/float64
-# in the same Python session (which would otherwise cause a deadlock).
-class CachedQuadratic32(CachedQuadratic):
-    """float32-specialized cached quadratic datafit."""
-    pass
-
-
-class CachedQuadratic64(CachedQuadratic):
-    """float64-specialized cached quadratic datafit."""
-    pass
-
-
-class LassoFastLoop(RegressorMixin, LinearModel):
-    """Zero-overhead Lasso for high-throughput multi-target regression.
-
-    Caches the design matrix, Lipschitz constants, and compiled solver
-    kernels across calls to ``fit``. When ``fit`` is called again with the
-    same design matrix, all O(np) overhead is skipped entirely.
-
-    Parameters
-    ----------
-    alpha : float, default=1.0
-        L1 regularisation strength.
-
-    max_iter : int, default=50
-        Maximum number of working-set iterations.
-
-    max_epochs : int, default=50_000
-        Maximum number of CD epochs per working-set subproblem.
-
-    p0 : int, default=10
-        Initial working-set size.
-
-    tol : float, default=1e-4
-        Convergence tolerance.
-
-    positive : bool, default=False
-        Enforce non-negative coefficients.
-
-    fit_intercept : bool, default=True
-        Whether to fit an intercept.
-
-    warm_start : bool, default=False
-        Reuse the previous solution as the starting point for the next fit.
-
-    ws_strategy : str, default="subdiff"
-        Working-set strategy: ``'subdiff'`` or ``'fixpoint'``.
-
-    verbose_debug : bool, default=False
-        Print per-call timing (Check / Warmup / Solve) to stderr.
-
-    Attributes
-    ----------
-    coef_ : ndarray of shape (n_features,)
-        Coefficients from the last ``fit`` call.
-
-    intercept_ : float
-        Intercept from the last ``fit`` call.
-    """
-
-    def __init__(self, alpha=1.0, max_iter=50, max_epochs=50_000, p0=10,
-                 tol=1e-4, positive=False, fit_intercept=True,
-                 warm_start=False, ws_strategy="subdiff", verbose_debug=False):
-        self.alpha = alpha
-        self.max_iter = max_iter
-        self.max_epochs = max_epochs
-        self.p0 = p0
-        self.tol = tol
-        self.positive = positive
-        self.fit_intercept = fit_intercept
-        self.warm_start = warm_start
-        self.ws_strategy = ws_strategy
-        self.verbose_debug = verbose_debug
-
-        # Cache state — populated on first fit, reused when X is the same
-        self.X_ = None
-        self._X_input_ref = None
-        self._datafit = None
-        self._penalty = None
-        self._solver = None
-
-    def _is_same_X(self, X):
-        """O(1) identity check against the cached design matrix."""
-        if self._X_input_ref is None:
-            return False
-        if X is self._X_input_ref:
-            return True
-        if X.shape != self._X_input_ref.shape or X.dtype != self._X_input_ref.dtype:
-            return False
-        if issparse(X) and issparse(self._X_input_ref):
-            return X.data.ctypes.data == self._X_input_ref.data.ctypes.data
-        if not issparse(X) and not issparse(self._X_input_ref):
-            return X.ctypes.data == self._X_input_ref.ctypes.data
-        return False
-
-    def _warm_up(self, X):
-        """Build all X-dependent cache: validate, Lipschitz, JIT-compile."""
-        self._X_input_ref = X
-        self.X_ = check_array(
-            X, accept_sparse="csc", dtype=[np.float64, np.float32], order="F",
-            copy=False, accept_large_sparse=False)
-
-        y_dummy = np.zeros(self.X_.shape[0], dtype=self.X_.dtype)
-        datafit = Quadratic()
-        if issparse(self.X_):
-            lipschitz = datafit.get_lipschitz_sparse(
-                self.X_.data, self.X_.indptr, self.X_.indices, y_dummy)
-        else:
-            lipschitz = datafit.get_lipschitz(self.X_, y_dummy)
-
-        # Pick the explicit precision subclass so Numba always gets a unique
-        # class identity and never collides between float32 and float64.
-        to_float32 = self.X_.dtype == np.float32
-        Klass = CachedQuadratic32 if to_float32 else CachedQuadratic64
-
-        self._datafit = compiled_clone(Klass(lipschitz), to_float32=to_float32)
-        self._penalty = compiled_clone(L1(self.alpha, self.positive), to_float32=to_float32)
-        self._solver = AndersonCD(
-            max_iter=self.max_iter, max_epochs=self.max_epochs, p0=self.p0,
-            tol=self.tol, ws_strategy=self.ws_strategy,
-            fit_intercept=self.fit_intercept, warm_start=self.warm_start,
-            verbose=0)
-
-    def fit(self, X, y, assume_same_X=True):
-        """Fit the model, reusing cached X-state when possible.
-
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-            Design matrix.
-
-        y : array-like of shape (n_samples,)
-            Target values.
-
-        assume_same_X : {True, False, None}, default=True
-            Cache control:
-
-            - ``True``  — always reuse cached state (fastest; safe when X is
-              mathematically identical across calls even if it's a new object).
-            - ``False`` — always rebuild the cache.
-            - ``None``  — auto-detect via O(1) memory-address check.
-
-        Returns
-        -------
-        self : LassoFastLoop
-        """
-        import time
-        t_start = time.perf_counter()
-
-        t0 = time.perf_counter()
-        if assume_same_X is True and self.X_ is not None:
-            is_same = True
-        elif assume_same_X is False:
-            is_same = False
-        else:
-            is_same = self._is_same_X(X)
-        t_check = time.perf_counter() - t0
-
-        t_warmup = 0.0
-        if not is_same:
-            t0 = time.perf_counter()
-            self._warm_up(X)
-            t_warmup = time.perf_counter() - t0
-
-        y = np.asanyarray(y, dtype=self.X_.dtype)
-        if not y.flags.c_contiguous:
-            y = np.ascontiguousarray(y)
-
-        # Initialize w and Xw with the exact dtype of X to avoid Numba precision errors
-        n_samples, n_features = self.X_.shape
-        n_w = n_features + 1 if self.fit_intercept else n_features
-        w = np.zeros(n_w, dtype=self.X_.dtype)
-        Xw = np.zeros(n_samples, dtype=self.X_.dtype)
-
-        t0 = time.perf_counter()
-        w, _, _ = self._solver._solve(self.X_, y, self._datafit, self._penalty, w, Xw)
-        t_solve = time.perf_counter() - t0
-
-        if self.fit_intercept:
-            self.coef_ = w[:-1]
-            self.intercept_ = w[-1]
-        else:
-            self.coef_ = w
-            self.intercept_ = 0.
-
-        if self.verbose_debug:
-            t_total = time.perf_counter() - t_start
-            if assume_same_X is True and is_same:
-                cache_status = "HIT (forced)"
-            elif assume_same_X is False:
-                cache_status = "MISS (forced)"
-            else:
-                cache_status = "HIT (auto)" if is_same else "MISS (auto)"
-            
-            format_str = "sparse" if issparse(self.X_) else "dense"
-            shape_str = f"{self.X_.shape[0]}x{self.X_.shape[1]}"
-            dtype_str = self.X_.dtype.name
-            
-            import sys
-            sys.stderr.write(
-                f"[FastLoop] {dtype_str} {format_str} {shape_str} | tol={self.tol:.0e} | "
-                f"Cache: {cache_status} | "
-                f"Check: {t_check*1000:.2f}ms | Warmup: {t_warmup:.3f}s | "
-                f"Solve: {t_solve:.3f}s | Total: {t_total:.3f}s\n")
-
-        return self
-
 
 
 

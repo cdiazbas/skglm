@@ -1,5 +1,6 @@
 import numpy as np
-from numba import njit
+import numba
+from numba import njit, prange
 from scipy import sparse
 from sklearn.utils import check_array
 from skglm.solvers.common import (
@@ -211,6 +212,119 @@ class AndersonCD(BaseSolver):
             obj_out.append(p_obj)
         return w, np.array(obj_out), stop_crit
 
+    def _solve_multi(self, X, Y_Kn, alpha):
+        """Solve K Lasso problems simultaneously using block coordinate descent.
+
+        Reads each column of X **once** per CD epoch regardless of the number
+        of targets, then parallelises the per-target gradient / prox / update
+        steps with Numba ``prange``.
+
+        Parameters
+        ----------
+        X : array, shape (n_samples, n_features), F-contiguous
+            Design matrix.  Must already be validated (dtype, order).
+
+        Y_Kn : array, shape (K, n_samples), C-contiguous
+            Targets stored as *rows* for cache-friendly per-target access.
+
+        alpha : float
+            L1 penalty strength.
+
+        Returns
+        -------
+        W : array, shape (n_features, K)
+            Coefficient matrix.
+        obj_out : ndarray
+            Stop-criterion value recorded at the end of each outer iteration.
+        stop_crit : float
+            Final stopping criterion value.
+        """
+        n_samples, n_features = X.shape
+        K = Y_Kn.shape[0]
+
+        W = np.zeros((n_features, K), dtype=X.dtype)
+        XW_Kn = np.zeros((K, n_samples), dtype=X.dtype)  # (K, n) contiguous rows
+
+        # Lipschitz constants: L[j] = ||X[:, j]||² / n  (same for all targets)
+        lipschitz = np.einsum('ij,ij->j', X, X) / n_samples  # (n_features,)
+
+        stop_crit = np.inf
+        obj_out = []
+
+        try:
+            from tqdm.auto import tqdm as _tqdm
+            _have_tqdm = True
+        except ImportError:
+            _have_tqdm = False
+
+        outer_range = range(self.max_iter)
+        if self.verbose and _have_tqdm:
+            outer_range = _tqdm(
+                outer_range,
+                desc=f"MultiLasso K={K} p={n_features}",
+                unit="iter",
+                dynamic_ncols=True,
+            )
+
+        for t in outer_range:
+            # ---- Working-set selection: max |grad_k| across all K targets ----
+            # grad_k[j] = X[:,j].T @ (XW_k - Y_k) / n  -- shape (K, p)
+            R_Kn = XW_Kn - Y_Kn                               # (K, n)
+            G_Kp = R_Kn @ X / n_samples                       # (K, p)
+            # opt[j] = max_k subdiff distance for feature j
+            grad_max = np.max(np.abs(G_Kp), axis=0)           # (p,)
+            opt = np.maximum(0.0, grad_max - alpha) / alpha
+            stop_crit = float(np.max(opt))
+
+            if self.verbose and _have_tqdm:
+                outer_range.set_postfix(stop_crit=f"{stop_crit:.2e}",
+                                        ws=0, refresh=False)
+            elif self.verbose:
+                print(f"[solve_multi] outer iter {t + 1}, "
+                      f"stop_crit={stop_crit:.2e}")
+
+            if stop_crit <= self.tol:
+                break
+
+            # Support: any non-zero across all K targets
+            support = np.any(W != 0, axis=1)           # (p,) bool
+            ws_size = max(
+                min(self.p0, n_features),
+                min(2 * int(support.sum()), n_features),
+            )
+            opt_sel = opt.copy()
+            opt_sel[support] = np.inf   # always keep support in WS
+            ws = np.argpartition(opt_sel, -ws_size)[-ws_size:].astype(np.int32)
+
+            if self.verbose and _have_tqdm:
+                outer_range.set_postfix(stop_crit=f"{stop_crit:.2e}",
+                                        ws=ws_size, refresh=True)
+
+            # ---- Inner epochs ---------------------------------------------------
+            for epoch in range(self.max_epochs):
+                _block_cd_epoch_multi(X, Y_Kn, W, XW_Kn, lipschitz, ws, alpha)
+
+                if epoch % 10 == 0:
+                    Rws_Kn = XW_Kn - Y_Kn                       # (K, n)
+                    Gws_Kp = Rws_Kn @ X[:, ws] / n_samples      # (K, ws_size)
+                    gmax_ws = np.max(np.abs(Gws_Kp), axis=0)    # (ws_size,)
+                    opt_ws = np.maximum(0.0, gmax_ws - alpha) / alpha
+                    stop_in = float(np.max(opt_ws))
+
+                    if max(self.verbose - 1, 0):
+                        print(f"  epoch {epoch + 1}, inner stop={stop_in:.2e}")
+
+                    if ws_size == n_features:
+                        if stop_in <= self.tol:
+                            break
+                    else:
+                        if stop_in < 0.3 * stop_crit:
+                            break
+
+            obj_out.append(stop_crit)
+
+        return W, np.array(obj_out), stop_crit
+
     def path(self, X, y, datafit, penalty, alphas=None, w_init=None,
              return_n_iter=False):
         X = check_array(X, 'csc', dtype=[np.float64, np.float32],
@@ -377,3 +491,75 @@ def _cd_epoch_sparse(X_data, X_indptr, X_indices, y, w, Xw, lc, datafit, penalty
         if diff != 0:
             for i in range(X_indptr[j], X_indptr[j + 1]):
                 Xw[X_indices[i]] += diff * X_data[i]
+
+
+@njit(parallel=True)
+def _block_cd_epoch_multi(X, Y_Kn, W, XW_Kn, lc, ws, alpha):
+    """Block CD epoch: update all K targets for each feature in ``ws``.
+
+    ``X[:, j]`` is read from memory **once** and shared across all K targets,
+    giving a K-fold reduction in design-matrix memory traffic compared with K
+    independent single-target epochs.  The per-target gradient / prox / residual-
+    update steps are parallelised over K with Numba ``prange``.
+
+    Parameters
+    ----------
+    X : F-contiguous array, shape (n_samples, n_features)
+        Design matrix.  F-order ensures column j is a contiguous slice.
+
+    Y_Kn : C-contiguous array, shape (K, n_samples)
+        Targets stored as rows so ``Y_Kn[k]`` is a contiguous length-n slice.
+
+    W : C-contiguous array, shape (n_features, K)
+        Coefficient matrix, updated in-place.
+
+    XW_Kn : C-contiguous array, shape (K, n_samples)
+        Running fitted values, updated in-place.
+
+    lc : array, shape (n_features,)
+        Coordinatewise Lipschitz constants.
+
+    ws : int32 array, shape (ws_size,)
+        Working-set feature indices.
+
+    alpha : float
+        L1 penalty strength.
+    """
+    n_samples = X.shape[0]
+    K = Y_Kn.shape[0]
+
+    for idx in range(ws.shape[0]):          # sequential over features (XW_Kn shared)
+        j = ws[idx]
+        lc_j = lc[j]
+        stepsize = 1.0 / lc_j if lc_j != 0.0 else 1000.0
+        thresh = alpha * stepsize
+        Xj = X[:, j]                        # contiguous column (F-order), loaded once
+
+        # --- Phase 1: gradient + prox for every target (parallel over K) --------
+        diffs = np.zeros(K, dtype=Xj.dtype)
+        for k in prange(K):
+            XW_k = XW_Kn[k]                # contiguous row  (n,)
+            Y_k = Y_Kn[k]                  # contiguous row  (n,)
+            g = 0.0
+            for i in range(n_samples):
+                g += Xj[i] * (XW_k[i] - Y_k[i])
+            g /= n_samples
+
+            old_w = W[j, k]
+            v = old_w - g * stepsize
+            if v > thresh:
+                new_w = v - thresh
+            elif v < -thresh:
+                new_w = v + thresh
+            else:
+                new_w = 0.0
+            W[j, k] = new_w
+            diffs[k] = new_w - old_w
+
+        # --- Phase 2: update residuals (parallel over K, independent per k) ------
+        for k in prange(K):
+            d = diffs[k]
+            if d != 0.0:
+                XW_k = XW_Kn[k]
+                for i in range(n_samples):
+                    XW_k[i] += d * Xj[i]
